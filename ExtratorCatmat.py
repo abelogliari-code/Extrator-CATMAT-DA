@@ -51,6 +51,10 @@ ctk.set_default_color_theme("blue")
 
 pausar_extracao     = threading.Event()
 pausar_busca_catmat = threading.Event()
+# Estado "set" = liberado. Inicializar aqui evita que um wait() bloqueie para
+# sempre em qualquer fluxo que esqueça de chamar .set() antes de começar.
+pausar_extracao.set()
+pausar_busca_catmat.set()
 cancelar_busca_catmat = False
 
 requests.packages.urllib3.disable_warnings(
@@ -71,9 +75,24 @@ _http.mount("http://",  _adapter)
 URL_BASE = "https://dadosabertos.compras.gov.br"
 TIMEOUT  = 120
 
+# =============================================================================
+# TIPOS DE BUSCA  —  espelha o seletor "tipo" do endpoint de Pesquisa de Preço
+#   /modulo-pesquisa-preco/1_consultarMaterial?tipo={tipo}&codigo={codigo}
+# =============================================================================
+TIPO_CATMAT = "codigoItemCatalogo"
+TIPO_PDM    = "codigoPdm"
+ROTULO_TIPO = {TIPO_CATMAT: "CATMAT", TIPO_PDM: "PDM"}
+TIPO_POR_ROTULO = {v: k for k, v in ROTULO_TIPO.items()}
+
+# Detectado na 1ª requisição e reaproveitado nas demais:
+#   None  → ainda não sabemos
+#   True  → API aceita a assinatura nova (tipo + codigo)
+#   False → API ainda na assinatura antiga (codigoItemCatalogo)
+_API_ACEITA_TIPO = None
+
 ordem_final_colunas = [
     "idCompra","idItemCompra","forma","modalidade","criterioJulgamento",
-    "numeroItemCompra","descricaoItem","codigoItemCatalogo","nomeUnidadeFornecimento",
+    "numeroItemCompra","descricaoItem","codigoItemCatalogo","codigoPdm","nomeUnidadeFornecimento",
     "siglaUnidadeFornecimento","nomeUnidadeMedida","capacidadeUnidadeFornecimento","siglaUnidadeMedida",
     "Unidade de Fornecimento","capacidade","quantidade","precoUnitario","Preco Total","percentualMaiorDesconto",
     "niFornecedor","nomeFornecedor","marca","codigoUasg","nomeUasg",
@@ -118,12 +137,18 @@ class ExcelChunkWriter:
     def write_dataframe(self, df: pd.DataFrame):
         if df is None or df.empty: return
         self._ensure_header(list(df.columns))
-        for col in self.header:
-            if col not in df.columns: df[col] = pd.NA
+        faltantes = [c for c in self.header if c not in df.columns]
+        if faltantes:
+            df = df.copy()          # não mutar o DataFrame do chamador
+            for col in faltantes: df[col] = pd.NA
         df = df[self.header]
         for _, row in df.iterrows():
             self._rollover_if_needed()
-            self.ws.append([None if pd.isna(v) else v for v in row])
+            # openpyxl levanta IllegalCharacterError em caracteres de controle,
+            # frequentes no texto livre vindo da API — sanitiza na gravação
+            self.ws.append([None if pd.isna(v) else
+                            (_CTRL_ILEGAIS.sub(" ", v) if isinstance(v, str) else v)
+                            for v in row])
             self.current_row_count += 1
 
     def finalize(self) -> List[str]:
@@ -139,6 +164,7 @@ class CSVChunkWriter:
         self.encoding = encoding; self.max_rows = max_rows_per_file
         self.part = 1; self.current_row_count = 0
         self.files_saved: List[str] = []; self.header_written = False
+        self.header: List[str] = []
 
     def _filepath(self):
         base, ext = os.path.splitext(self.base_filename)
@@ -147,6 +173,12 @@ class CSVChunkWriter:
 
     def write_dataframe(self, df: pd.DataFrame):
         if df is None or df.empty: return
+        # O conjunto de colunas varia entre páginas (processar_dataframe_final
+        # descarta colunas 100% vazias). Sem reindexar pelo cabeçalho da 1ª
+        # página, o append gravaria valores sob colunas erradas.
+        if not self.header:
+            self.header = list(df.columns)
+        df = df.reindex(columns=self.header)
         if self.current_row_count + len(df) > self.max_rows:
             self.part += 1; self.current_row_count = 0; self.header_written = False
         path = self._filepath()
@@ -188,41 +220,226 @@ def validar_e_obter_datas(ini: str, fim: str):
     return i_api, f_api, None
 
 
-def parse_csv_text(csv_text: str) -> pd.DataFrame:
-    # Remove linhas vazias e artefatos de aspas soltas (ex: linha contendo só '"')
-    # que surgem quando um campo de texto contém quebras de linha internas
-    lines = [ln for ln in csv_text.splitlines()
-             if ln.strip() and ln.strip().strip('"').strip() != ""]
-    if not lines: return pd.DataFrame()
+# =============================================================================
+# PARSER DE PÁGINA CSV
+# -----------------------------------------------------------------------------
+# A API devolve CSV com campos de texto livre (descricaoItem) que podem conter
+# quebras de linha cruas, ';' e aspas desbalanceadas. Três armadilhas conhecidas:
+#
+#   1. str.splitlines() quebra em \x0b \x0c \x1c-\x1e \x85 \u2028 \u2029, que o
+#      parser CSV (e o servidor) tratam como texto comum → fragmentos fantasma.
+#   2. Contar ';' com str.split ignora aspas → campos citados com ';' interno
+#      viram "excesso de colunas" e a linha é remontada torta.
+#   3. Descartar linhas que contêm só '"' apaga o fechamento de um campo
+#      multilinha → o parser engole as linhas seguintes e some com registros.
+#
+# A abordagem aqui é: csv.reader sobre o texto bruto (que já resolve quebras
+# dentro de campos citados), remontagem no nível de CAMPO e conferência do
+# número de registros contra o esperado da página.
+# =============================================================================
+
+# Quebras que str.splitlines() reconhece mas o CSV não
+_QUEBRAS_FALSAS = re.compile(r"[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# Caracteres de controle que o openpyxl recusa ao gravar .xlsx
+_CTRL_ILEGAIS   = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# Linhas de metadados (totalRegistros / total paginas / paginas restantes)
+_RE_METADADO    = re.compile(
+    r'^\s*"?\s*total\s*(de\s*)?(registros|p[áa]ginas?|p[áa]ginas?\s+restantes)\s*:',
+    re.IGNORECASE)
+
+
+def _limpar_campo(v):
+    """Normaliza um campo: tira controles ilegais e colapsa quebras internas."""
+    if not v:
+        return ""
+    v = v.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    v = _QUEBRAS_FALSAS.sub(" ", v)
+    v = _CTRL_ILEGAIS.sub(" ", v)
+    return re.sub(r"[ \t]{2,}", " ", v).strip()
+
+
+def _ler_registros(texto, quoting):
+    """csv.reader sobre o texto bruto — resolve quebras dentro de campos citados."""
     try:
-        # QUOTE_MINIMAL respeita aspas duplas como delimitadores de campo,
-        # tratando corretamente campos que contêm ponto-e-vírgula ou quebras de linha
-        return pd.read_csv(StringIO("\n".join(lines)), sep=";", dtype=str,
-                           engine="python", on_bad_lines="skip",
-                           quoting=csv.QUOTE_MINIMAL)
-    except Exception:
-        return pd.DataFrame()
+        return list(csv.reader(StringIO(texto, newline=""), delimiter=";",
+                               quotechar='"', quoting=quoting, strict=False))
+    except csv.Error:
+        return []
+
+
+def _remontar(registros, ncols, idx_livre):
+    """
+    Remonta registros quebrados.
+      len < ncols → fragmento: a quebra caiu DENTRO de um campo, então o último
+                    campo do fragmento e o primeiro do seguinte são as duas
+                    metades do mesmo campo (por isso a junção é por campo, e
+                    não pela linha inteira).
+      len > ncols → ';' extra em campo sem aspas: recolhe o excedente de volta
+                    para o campo de texto livre em vez de descartar a linha.
+    Retorna (linhas, reparos, descartes).
+    """
+    linhas = []; buf = None; reparos = 0; descartes = 0
+    for reg in registros:
+        remontado = False
+        if buf is not None:
+            cabeca = (buf[-1] + " " + (reg[0] if reg else "")).strip()
+            reg = buf[:-1] + [cabeca] + reg[1:]
+            buf = None; remontado = True
+
+        n = len(reg)
+        if n < ncols:
+            buf = reg                       # ainda incompleto — segue acumulando
+            continue
+        if n == ncols:
+            if remontado: reparos += 1
+            linhas.append(reg)
+        elif idx_livre is not None and idx_livre < ncols:
+            excedente = n - ncols
+            reg = (reg[:idx_livre]
+                   + [";".join(reg[idx_livre:idx_livre + excedente + 1])]
+                   + reg[idx_livre + excedente + 1:])
+            reparos += 1
+            linhas.append(reg)
+        else:
+            descartes += 1
+    if buf is not None:
+        descartes += 1                      # fragmento órfão no fim da página
+    return linhas, reparos, descartes
+
+
+def _montar_pagina(texto, quoting):
+    """Extrai (header, linhas, reparos, descartes) de uma página com um dado quoting."""
+    registros = [r for r in _ler_registros(texto, quoting) if any(c.strip() for c in r)]
+    registros = [r for r in registros if not _RE_METADADO.match(r[0] if r else "")]
+    if not registros:
+        return None, [], 0, 0
+    header = [c.strip() for c in registros[0]]
+    ncols  = len(header)
+    if ncols < 2:
+        return None, [], 0, 0
+    idx_livre = header.index("descricaoItem") if "descricaoItem" in header else None
+    linhas, reparos, descartes = _remontar(registros[1:], ncols, idx_livre)
+    return header, linhas, reparos, descartes
+
+
+def parse_pagina_csv(csv_text, esperado_na_pagina=None):
+    """
+    Converte o CSV de uma página em DataFrame com diagnóstico confiável.
+
+    Retorna (df, diag), diag = {
+        "linhas", "esperado", "reparos", "descartes", "modo", "ok", "motivo"
+    }
+    'ok' é False sempre que a página não entregou exatamente os registros
+    esperados — é essa conferência (e não uma heurística de ';') que garante
+    que nenhuma página problemática passe batido.
+    """
+    diag = {"linhas": 0, "esperado": esperado_na_pagina, "reparos": 0,
+            "descartes": 0, "modo": "aspas", "ok": True, "motivo": ""}
+    if not csv_text:
+        diag.update(ok=False, motivo="pagina vazia")
+        return pd.DataFrame(), diag
+
+    melhor = None
+    for modo, quoting in (("aspas", csv.QUOTE_MINIMAL), ("literal", csv.QUOTE_NONE)):
+        header, linhas, reparos, descartes = _montar_pagina(csv_text, quoting)
+        if header is None:
+            continue
+        cand = {"header": header, "linhas": linhas, "reparos": reparos,
+                "descartes": descartes, "modo": modo}
+        # Bateu o esperado no modo com aspas: não precisa da segunda leitura
+        if esperado_na_pagina is not None and len(linhas) == esperado_na_pagina:
+            melhor = cand
+            break
+        # Senão, fica com o que recupera mais registros e descarta menos
+        if melhor is None or (len(linhas), -descartes) > (len(melhor["linhas"]),
+                                                          -melhor["descartes"]):
+            melhor = cand
+
+    if melhor is None:
+        diag.update(ok=False, motivo="cabecalho nao identificado")
+        return pd.DataFrame(), diag
+
+    dados = [[_limpar_campo(c) for c in ln] for ln in melhor["linhas"]]
+    df = pd.DataFrame(dados, columns=melhor["header"], dtype=str)
+
+    diag.update(linhas=len(df), reparos=melhor["reparos"],
+                descartes=melhor["descartes"], modo=melhor["modo"])
+    if esperado_na_pagina is not None and len(df) != esperado_na_pagina:
+        diag["ok"] = False
+        diag["motivo"] = f"{len(df)} de {esperado_na_pagina} registros"
+    elif melhor["descartes"]:
+        diag["ok"] = False
+        diag["motivo"] = f"{melhor['descartes']} linha(s) descartada(s)"
+    return df, diag
+
+
+def parse_csv_text(csv_text: str) -> pd.DataFrame:
+    """Compatibilidade: mantém a assinatura antiga sobre o novo motor."""
+    df, _ = parse_pagina_csv(csv_text)
+    return df
 
 
 def ler_pagina_catmat(codigo, pagina, URL_BASE, TAMANHO_PAGINA, TIMEOUT,
-                      data_compra_inicio=None, data_compra_fim=None):
+                      data_compra_inicio=None, data_compra_fim=None,
+                      tipo=TIPO_CATMAT):
+    """
+    Lê uma página de Registros de Preço.
+
+    tipo — equivale ao seletor "tipo" do endpoint de Pesquisa de Preço:
+        TIPO_CATMAT ("codigoItemCatalogo") → codigo é um CATMAT
+        TIPO_PDM    ("codigoPdm")          → codigo é um PDM (traz todos os
+                                             CATMATs do PDM de uma só vez)
+
+    Envia a assinatura nova (tipo + codigo). Se o servidor recusar (400/404) e a
+    busca for por CATMAT, refaz com a assinatura antiga (codigoItemCatalogo),
+    mantendo compatibilidade com instâncias ainda não atualizadas da API.
+    """
+    global _API_ACEITA_TIPO
     URL = f"{URL_BASE}/modulo-pesquisa-preco/1.1_consultarMaterial_CSV"
-    params = {"tamanhoPagina": TAMANHO_PAGINA, "codigoItemCatalogo": int(codigo), "pagina": int(pagina)}
-    if data_compra_inicio: params["dataCompraInicio"] = data_compra_inicio
-    if data_compra_fim:    params["dataCompraFim"]    = data_compra_fim
-    tentativas = 0
-    while tentativas < 2:
-        try:
-            resp = _http.get(URL, params=params, timeout=TIMEOUT)
-            if resp.status_code == 429:
-                time.sleep(15 if tentativas == 0 else 30); tentativas += 1; continue
-            resp.raise_for_status()
-            return None, resp.content.decode("utf-8-sig", errors="replace")
-        except requests.exceptions.ConnectionError as e:
-            return None, f"ERRO_CONEXAO: {e}"
-        except requests.exceptions.RequestException as e:
-            return None, f"ERRO_REQUISICAO: {e}"
-    return None, f"ERRO_REQUISICAO: 429 persistente para CATMAT {codigo}"
+
+    base = {"tamanhoPagina": TAMANHO_PAGINA, "pagina": int(pagina)}
+    if data_compra_inicio: base["dataCompraInicio"] = data_compra_inicio
+    if data_compra_fim:    base["dataCompraFim"]    = data_compra_fim
+
+    def _requisitar(params):
+        """Retorna (csv_text, erro, status_http). csv_text=None quando falhou."""
+        tentativas = 0
+        while tentativas < 2:
+            try:
+                resp = _http.get(URL, params=params, timeout=TIMEOUT)
+                if resp.status_code == 429:
+                    time.sleep(15 if tentativas == 0 else 30); tentativas += 1; continue
+                if resp.status_code in (400, 404):
+                    return None, f"ERRO_REQUISICAO: HTTP {resp.status_code}", resp.status_code
+                resp.raise_for_status()
+                return resp.content.decode("utf-8-sig", errors="replace"), None, 200
+            except requests.exceptions.ConnectionError as e:
+                return None, f"ERRO_CONEXAO: {e}", None
+            except requests.exceptions.RequestException as e:
+                return None, f"ERRO_REQUISICAO: {e}", None
+        return None, f"ERRO_REQUISICAO: 429 persistente para {tipo} {codigo}", 429
+
+    # ── 1ª opção: assinatura nova (tipo + codigo) ────────────────────────────
+    if _API_ACEITA_TIPO is not False:
+        csv_text, erro, status = _requisitar(
+            dict(base, tipo=tipo, codigo=str(int(codigo))))
+        if csv_text is not None:
+            _API_ACEITA_TIPO = True
+            return None, csv_text
+        # Só cai para o modo legado quando o servidor recusa a assinatura
+        if status not in (400, 404):
+            return None, erro
+        _API_ACEITA_TIPO = False
+
+    # ── 2ª opção: assinatura antiga — existe apenas para CATMAT ──────────────
+    if tipo != TIPO_CATMAT:
+        return None, ("ERRO_REQUISICAO: esta instância da API não aceita busca "
+                      f"por {tipo}. Selecione CATMAT.")
+
+    csv_text, erro, _ = _requisitar(dict(base, codigoItemCatalogo=int(codigo)))
+    if csv_text is not None:
+        return None, csv_text
+    return None, erro
 
 
 def _normalizar_campo(item: dict, *candidatos, default=""):
@@ -383,11 +600,15 @@ def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
 
 
 def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
-                            _pausar_conexao_fn=None):
+                            _pausar_conexao_fn=None, tipo=TIPO_CATMAT,
+                            _cancelado_fn=None, TAMANHO_PAGINA=500):
     if _pausar_conexao_fn is None:
         _pausar_conexao_fn = lambda: None  # no-op se não fornecida
+    if _cancelado_fn is None:
+        _cancelado_fn = lambda: False
     """
-    Worker puro: busca e processa todas as páginas de um CATMAT.
+    Worker puro: busca e processa todas as páginas de um CATMAT ou de um PDM,
+    conforme `tipo` (TIPO_CATMAT | TIPO_PDM).
     Pode rodar em qualquer thread — não acessa estado compartilhado.
     Retorna: (codigo, dfs_e_meta, tipo, reg_esp, pag_corr)
       tipo: "ok" | "vazio" | "erro" | "conexao"
@@ -400,7 +621,8 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
 
     try:
         while True:
-            _, csv_text = ler_pagina_catmat(codigo, 1, URL_BASE, 500, TIMEOUT, d_ini, d_fim)
+            _, csv_text = ler_pagina_catmat(codigo, 1, URL_BASE, TAMANHO_PAGINA, TIMEOUT,
+                                            d_ini, d_fim, tipo=tipo)
             if csv_text and csv_text.startswith("ERRO_CONEXAO"):
                 # Pausa automática + contagem regressiva de 60s antes de retentar
                 _pausar_conexao_fn()
@@ -422,9 +644,21 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
         if reg_esp == 0:
             return codigo, [], "vazio", 0, {}
 
+        # Total de páginas por cálculo, não por regex no corpo do CSV: se a
+        # linha de metadados vier ausente ou com outro rótulo, o valor antigo
+        # caía em 1 e a extração era truncada em silêncio nos 500 primeiros.
+        total_paginas = max(1, math.ceil(reg_esp / TAMANHO_PAGINA))
+
         while True:
-            is_c, csv_c = pagina_corrompida(csv_text)
-            df_pag = parse_csv_text(csv_c)
+            # Respeita pausa/cancelamento também ENTRE PÁGINAS de um mesmo código
+            pausar_extracao.wait()
+            if _cancelado_fn():
+                break
+
+            esperado_pag = max(0, min(TAMANHO_PAGINA,
+                                      reg_esp - TAMANHO_PAGINA * (pagina_atual - 1)))
+            df_pag, diag = parse_pagina_csv(csv_text, esperado_pag or None)
+            is_c = not diag["ok"]
 
             if is_c:
                 pag_corr.setdefault(codigo, []).append(str(pagina_atual))
@@ -438,20 +672,25 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
                         pass
 
             if df_pag is not None and not df_pag.empty:
-                df_pag.loc[:, "codigoItemCatalogo"] = str(codigo)
+                if tipo == TIPO_PDM:
+                    # Busca por PDM devolve vários CATMATs: preserva o
+                    # codigoItemCatalogo original e apenas anota o PDM de origem
+                    df_pag.loc[:, "codigoPdm"] = str(codigo)
+                else:
+                    df_pag.loc[:, "codigoItemCatalogo"] = str(codigo)
                 df_proc = processar_dataframe_final(df_pag, ordem_final_colunas)
                 dfs_e_meta.append((df_proc, is_c, pagina_atual))
 
             if total_paginas is None:
-                mp = re.search(r"total\s*p[áa]ginas?\s*:\s*(\d+)", csv_text, re.IGNORECASE)
-                total_paginas = int(mp.group(1)) if mp else 1
+                total_paginas = 1
 
             pagina_atual += 1
             if pagina_atual > total_paginas:
                 break
             time.sleep(0.5)
-            _, csv_text = ler_pagina_catmat(codigo, pagina_atual, URL_BASE, 500, TIMEOUT,
-                                            d_ini, d_fim)
+            _, csv_text = ler_pagina_catmat(codigo, pagina_atual, URL_BASE,
+                                            TAMANHO_PAGINA, TIMEOUT,
+                                            d_ini, d_fim, tipo=tipo)
             if csv_text is None or csv_text.startswith("ERRO_"):
                 break
 
@@ -459,58 +698,6 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
 
     except Exception:
         return codigo, [], "erro", 0, {}
-
-
-def pagina_corrompida(csv_text: str):
-    """
-    Detecta e corrige dois tipos de corrupção no CSV da API:
-    1. Linhas fragmentadas (< ncols campos) — campos com \n interno
-    2. Linhas com aspas soltas (campo contendo só '"') — artefato de \n em campo com aspas
-    Retorna (houve_correcao, csv_corrigido).
-    """
-    if not csv_text: return False, csv_text
-    linhas = [ln for ln in csv_text.splitlines() if ln.strip()]
-    if not linhas: return False, csv_text
-    try:
-        hi = next(i for i, ln in enumerate(linhas)
-                  if not ln.lower().startswith(("totalregistros:", "totalpaginas:")))
-        header_line = linhas[hi]
-        ncols = len(header_line.split(";"))
-    except StopIteration:
-        return False, csv_text
-    if ncols == 0: return False, csv_text
-
-    out = list(linhas[:hi]) + [header_line]
-    buf = ""; corrigido = False
-
-    for ln in linhas[hi+1:]:
-        if ln.lower().startswith(("totalregistros:", "totalpaginas:")):
-            if buf: out.append(buf); buf = ""
-            out.append(ln); continue
-
-        # Descartar artefatos de aspas soltas (tipo 2)
-        if ln.strip().strip('"').strip() == "":
-            corrigido = True; continue
-
-        atual = (buf + " " + ln).strip() if buf else ln
-        n = len(atual.split(";"))
-
-        if n < ncols:
-            # Fragmento — acumular (tipo 1)
-            buf = atual; corrigido = True
-        elif n == ncols:
-            out.append(atual); buf = ""
-        else:
-            # Excesso de colunas: se a linha sozinha tem ncols, usar ela diretamente
-            if len(ln.split(";")) == ncols:
-                if buf: corrigido = True
-                out.append(ln); buf = ""
-            else:
-                # Manter como está — parse_csv_text vai lidar com on_bad_lines="skip"
-                out.append(atual); buf = ""; corrigido = True
-
-    if buf: out.append(buf)
-    return corrigido, "\n".join(out)
 
 
 def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.DataFrame:
@@ -617,10 +804,17 @@ Primeiros Passos
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   - Para uma extracao direta com uma lista pronta, use esta aba.
-    O arquivo Excel ou CSV deve ter a coluna: codigoItemCatalogo
+    Escolha em "Buscar por" se os codigos da planilha sao CATMATs ou PDMs
+    (equivale ao parametro "tipo" da API de Pesquisa de Preco):
+      CATMAT -> coluna codigoItemCatalogo
+      PDM    -> coluna codigoPdm  (traz todos os itens do PDM de uma vez)
+    A coluna generica "codigo" tambem e aceita nos dois modos.
 
   - Para descobrir itens, use a aba "Extracao por Classes" e, ao final,
     envie os CATMATs encontrados para a extracao nesta aba.
+    Nessa aba, marcando "Extrair precos direto por PDM" o programa pula a
+    expansao PDM -> CATMAT e consulta a Pesquisa de Preco com tipo=codigoPdm,
+    o que reduz drasticamente o numero de requisicoes.
 
   - Utilize os filtros de data (DD-MM-AAAA) para restringir os resultados
     a um periodo especifico de compras (Data de Inicio e Data Final).
@@ -702,6 +896,7 @@ class App(ctk.CTk):
         self.count_vazios         = 0
         self._data_inicio         = None
         self._data_fim            = None
+        self._tipo_busca          = TIPO_CATMAT
         self.lista_pdms_df        = pd.DataFrame()
         self.lista_catmats: List  = []
 
@@ -779,6 +974,23 @@ class App(ctk.CTk):
             .pack(side="left", expand=True, fill="x")
         _btn(r, "Procurar…", self._escolher_arquivo, variant="ghost", width=90)\
             .pack(side="left", padx=(8,0))
+
+        _sep(inn)
+
+        # tipo de busca — espelha o parâmetro "tipo" da API
+        rt = ctk.CTkFrame(inn, fg_color="transparent"); rt.pack(fill="x", pady=3)
+        _lbl(rt, "Buscar por:", color=C_TEXT_MED).pack(side="left", padx=(0,10))
+        self.var_tipo1 = tk.StringVar(value=ROTULO_TIPO[TIPO_CATMAT])
+        ctk.CTkSegmentedButton(
+            rt, values=[ROTULO_TIPO[TIPO_CATMAT], ROTULO_TIPO[TIPO_PDM]],
+            variable=self.var_tipo1, command=self._on_tipo_extracao,
+            font=("Segoe UI", 12), width=180, corner_radius=6,
+            fg_color=C_BG, selected_color=C_ACCENT, selected_hover_color=C_ACCENT_H,
+            unselected_color=C_BG, unselected_hover_color=C_BORDER,
+            text_color=C_TEXT).pack(side="left")
+        self.lbl_hint_tipo = _lbl(rt, "coluna esperada no arquivo: codigoItemCatalogo",
+                                  size=10, color=C_TEXT_LIGHT)
+        self.lbl_hint_tipo.pack(side="left", padx=(12,0))
 
         _sep(inn)
 
@@ -936,6 +1148,18 @@ class App(ctk.CTk):
                         fg_color=C_ACCENT, border_color=C_BORDER)            .pack(side="left")
         _lbl(row_chk, "  (gera um arquivo separado para cada classe informada)",
              size=10, color=C_TEXT_LIGHT).pack(side="left")
+
+        # Extração direta por PDM — usa tipo=codigoPdm na Pesquisa de Preço
+        row_pdm = ctk.CTkFrame(inn1, fg_color="transparent")
+        row_pdm.pack(fill="x", pady=(4,0))
+        self.var_extrair_por_pdm = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(row_pdm,
+                        text="Extrair preços direto por PDM (tipo=codigoPdm)",
+                        variable=self.var_extrair_por_pdm,
+                        font=("Segoe UI", 12), text_color=C_TEXT,
+                        fg_color=C_ACCENT, border_color=C_BORDER).pack(side="left")
+        _lbl(row_pdm, "  (dispensa a expansão PDM → CATMAT: muito mais rápido)",
+             size=10, color=C_TEXT_LIGHT).pack(side="left")
         # Linha de pasta de destino — visível só quando checkbox marcado
         self.frame_pasta_classes = ctk.CTkFrame(inn1, fg_color="transparent")
         row_pasta = ctk.CTkFrame(self.frame_pasta_classes, fg_color="transparent")
@@ -1083,24 +1307,37 @@ class App(ctk.CTk):
         else:
             self.frame_pasta.pack_forget()
 
+    def _on_tipo_extracao(self, valor=None):
+        """Atualiza a dica de coluna quando o usuário troca CATMAT ↔ PDM."""
+        tipo = TIPO_POR_ROTULO.get(self.var_tipo1.get(), TIPO_CATMAT)
+        self.lbl_hint_tipo.configure(
+            text=f"coluna esperada no arquivo: {tipo}")
+
+    def _tipo_extracao(self):
+        """Tipo de busca selecionado na aba de extração."""
+        return TIPO_POR_ROTULO.get(self.var_tipo1.get(), TIPO_CATMAT)
+
     def _start(self):
         arq = self.var_arquivo.get().strip()
         if not arq:
             messagebox.showerror("Arquivo obrigatório",
                                  "Selecione um arquivo de códigos."); return
+        tipo = self._tipo_extracao()
         try:
             df_c = pd.read_excel(arq) if arq.lower().endswith(".xlsx") \
                    else pd.read_csv(arq, sep=";")
-            if "codigoItemCatalogo" not in df_c.columns:
+            # Aceita a coluna do tipo escolhido ou a coluna genérica 'codigo'
+            col = next((c for c in (tipo, "codigo") if c in df_c.columns), None)
+            if col is None:
                 messagebox.showerror("Coluna ausente",
-                    "O arquivo deve ter a coluna 'codigoItemCatalogo'."); return
-            codigos = pd.Series(df_c["codigoItemCatalogo"]).dropna()\
+                    f"O arquivo deve ter a coluna '{tipo}' (ou 'codigo')."); return
+            codigos = pd.Series(df_c[col]).dropna()\
                         .astype(int).drop_duplicates().tolist()
         except Exception as e:
             messagebox.showerror("Erro ao ler arquivo", str(e)); return
         d_i, d_f, err = validar_e_obter_datas(self.var_ini1.get(), self.var_fim1.get())
         if err: messagebox.showerror("Data inválida", err); return
-        self._iniciar_processo(codigos, self.var_fmt.get(), d_i, d_f)
+        self._iniciar_processo(codigos, self.var_fmt.get(), d_i, d_f, tipo=tipo)
 
     def _cancelar(self):
         if not self.processing: return
@@ -1308,6 +1545,15 @@ class App(ctk.CTk):
     def _buscar_e_extrair(self):
         pdms = self._pdms_sel()
         if not pdms: messagebox.showerror("Nenhum selecionado","Selecione PDMs."); return
+        # Modo direto: pula a descoberta de CATMATs e consulta a Pesquisa de
+        # Preço com tipo=codigoPdm
+        if self.var_extrair_por_pdm.get():
+            d_i, d_f, err = validar_e_obter_datas(self.var_ini2.get(), self.var_fim2.get())
+            if err: messagebox.showerror("Data inválida", err); return
+            self._log(f"⏩ {len(pdms)} PDMs — extração direta (tipo=codigoPdm).", "info")
+            self._iniciar_processo(pdms, self.var_fmt.get(), d_i, d_f, tipo=TIPO_PDM)
+            self.after(100, lambda: self.tabs.set("  Extração por CATMAT  "))
+            return
         self._start_busca(pdms, "extrair")
 
     def _start_busca(self, pdms, acao):
@@ -1363,7 +1609,7 @@ class App(ctk.CTk):
                                          filetypes=[("CSV","*.csv")])
         if p:
             pd.DataFrame(self.lista_catmats, columns=["codigoItemCatalogo"])\
-              .to_csv(p, index=False, sep=";")
+              .to_csv(p, index=False, sep=";", encoding="utf-8-sig")
             messagebox.showinfo("Exportado", f"{len(self.lista_catmats)} CATMATs:\n{p}")
 
     def _pausar_busca(self):
@@ -1407,7 +1653,7 @@ class App(ctk.CTk):
                 "Use Buscar e Extrair para gerar arquivos por classe.")
             return
         self._iniciar_processo(self.lista_catmats, self.var_fmt.get(), d_i, d_f,
-                               catmats_por_classe=mapa)
+                               catmats_por_classe=mapa, tipo=TIPO_CATMAT)
         self.after(100, lambda: self.tabs.set("  Extração por CATMAT  "))
 
     def _buscar_e_extrair_classes(self):
@@ -1440,6 +1686,8 @@ class App(ctk.CTk):
         self.count_vazios = 0
         pausar_extracao.set()
         pausar_busca_catmat.set()  # necessário para o fluxo automatizado
+        global cancelar_busca_catmat
+        cancelar_busca_catmat = False   # zera resíduo de cancelamento anterior
 
         self.log.configure(state="normal"); self.log.delete("1.0","end")
         self.log.configure(state="disabled")
@@ -1462,20 +1710,26 @@ class App(ctk.CTk):
             if d_f: txt += "  Fim: "    + fd(d_f)
             self._log(txt, "date")
         self._log("📋 " + str(len(partes)) + " classe(s): " + " | ".join(partes) + "\n", "info")
+        tipo_busca = TIPO_PDM if self.var_extrair_por_pdm.get() else TIPO_CATMAT
+        self._tipo_busca = tipo_busca
+        self._log("🎯 Tipo de busca: " + ROTULO_TIPO[tipo_busca] +
+                  "  (tipo=" + tipo_busca + ")", "info")
         if pasta_dest:
             self._log("📂 Destino: " + pasta_dest, "info")
 
         self.after(100, lambda: self.tabs.set("  Extração por CATMAT  "))
         threading.Thread(
             target=self._fluxo_classes_thread,
-            args=(partes, pasta_dest, fmt, d_i, d_f),
+            args=(partes, pasta_dest, fmt, d_i, d_f, tipo_busca),
             daemon=True
         ).start()
 
-    def _fluxo_classes_thread(self, classes_lista, pasta_dest, fmt, d_ini, d_fim):
+    def _fluxo_classes_thread(self, classes_lista, pasta_dest, fmt, d_ini, d_fim,
+                              tipo_busca=TIPO_CATMAT):
         """
         Thread principal do fluxo por classe.
-        Para cada classe: PDMs → CATMATs → Registros de Preços → salva arquivo + relatório
+        tipo_busca = TIPO_CATMAT → Classe → PDMs → CATMATs → Registros de Preços
+        tipo_busca = TIPO_PDM    → Classe → PDMs → Registros de Preços (direto)
         Retry em todos os níveis: classes, PDMs e CATMATs com erro.
         """
         ext          = "csv" if fmt == "csv" else "xlsx"
@@ -1485,128 +1739,9 @@ class App(ctk.CTk):
         total_catmats_acum = 0
         classes_com_falha  = []   # classes que não retornaram PDMs
 
-        # ── Helper: extrai os registros de preços de um CATMAT ────────────────
-        # Retorna (baixados, tipo_resultado)
-        # tipo_resultado: "ok" | "vazio" | "erro"
-        def _extrair_catmat(codigo, writer, reg_baixados, reg_esperados, pag_corrompidas):
-            baixados = 0; pagina_atual = 1; total_paginas = None
-            try:
-                _, csv_text = ler_pagina_catmat(codigo, 1, URL_BASE, 500, TIMEOUT, d_ini, d_fim)
-                if csv_text and csv_text.startswith("ERRO_CONEXAO"):
-                    return 0, "conexao"
-                if csv_text is None or csv_text.startswith("ERRO_REQUISICAO"):
-                    return 0, "erro"   # erro de API — pode ser retentado
-
-                m = re.search(r"totalRegistros\s*:\s*(\d+)", csv_text, re.IGNORECASE)
-                reg_esp = int(m.group(1)) if m else 0
-                reg_esperados[codigo] = reg_esp
-                if reg_esp == 0:
-                    return 0, "vazio"  # genuinamente sem dados — não retenta
-
-                while True:
-                    if not self.processing: break
-                    is_c, csv_c = pagina_corrompida(csv_text)
-                    df_pag = parse_csv_text(csv_c)
-                    if is_c:
-                        pag_corrompidas.setdefault(codigo, []).append(str(pagina_atual))
-                        if salvar_corr and pasta_corr:
-                            dest_c = os.path.join(pasta_corr,
-                                "cod_" + str(codigo) + "_pag_" + str(pagina_atual) + "_corr.csv")
-                            try:
-                                with open(dest_c, "w", encoding="utf-8-sig") as f:
-                                    f.write(csv_text)
-                            except Exception: pass
-                        self._ui(lambda cod=codigo, p=pagina_atual:
-                            self._log("⚠️  Cód " + str(cod) + " Pág " + str(p) + ": corrigida.", "warn"))
-                        self.count_corrigidas += 1
-                        self._ui(lambda v=self.count_corrigidas: self._stat("k_corr", v))
-                    else:
-                        self._ui(lambda cod=codigo, p=pagina_atual:
-                            self._log("✅  Cód " + str(cod) + " Pág " + str(p) + ": OK.", "ok"))
-
-                    if df_pag is not None and not df_pag.empty:
-                        df_pag.loc[:, "codigoItemCatalogo"] = str(codigo)
-                        df_proc = processar_dataframe_final(df_pag, ordem_final_colunas)
-                        baixados += len(df_proc)
-                        self.total_baixados += len(df_proc)
-                        writer.write_dataframe(df_proc)
-                        reg = self.total_baixados
-                        self._ui(lambda r=reg:
-                            self._stat("k_reg", str(r).replace(",",".")))
-
-                    if total_paginas is None:
-                        mp = re.search(r"total\s*p[áa]ginas?\s*:\s*(\d+)", csv_text, re.IGNORECASE)
-                        total_paginas = int(mp.group(1)) if mp else 1
-                    pagina_atual += 1
-                    if pagina_atual > total_paginas: break
-                    time.sleep(0.5)
-                    _, csv_text = ler_pagina_catmat(codigo, pagina_atual, URL_BASE,
-                                                    500, TIMEOUT, d_ini, d_fim)
-                    if csv_text is None or csv_text.startswith("ERRO_"): break
-
-                return baixados, "ok"
-            except Exception as e:
-                etxt = "❌  Erro CATMAT " + str(codigo) + ": " + str(e)
-                self._ui(lambda t=etxt: self._log(t, "err"))
-                return 0, "erro"
-
-        # ── Helper: processa uma classe completa ──────────────────────────────
-        def _processar_classe(classe, idx_c, total_c):
-            nonlocal total_catmats_acum
-            ic, tc = idx_c, total_c
-            sep = "─" * 50
-            hdr = sep + "\n📦  CLASSE " + classe + "  (" + str(ic) + "/" + str(tc) + ")\n" + sep
-            self._ui(lambda h=hdr: self._log("\n" + h, "date"))
-            self._ui(lambda c=classe, i=ic, t=tc:
-                self.set_status("Status: Classe " + c + " (" + str(i) + "/" + str(t) + ") — PDMs…"))
-
-            # ── 1. PDMs ───────────────────────────────────────────────────────
-            resultado = buscar_pdms_por_classe(int(classe), URL_BASE, TIMEOUT)
-            if resultado is None:
-                return False   # falhou — será retentada
-            df_pdms, _ = resultado
-            pdms_lista  = df_pdms["codigoPdm"].astype(int).tolist()
-            n_pdms = len(pdms_lista)
-            self._ui(lambda c=classe, n=n_pdms:
-                self._log("✅  Classe " + c + ": " + str(n) + " PDMs.", "ok"))
-
-            # ── 2. CATMATs ────────────────────────────────────────────────────
-            self._ui(lambda c=classe, n=n_pdms:
-                self.set_status("Status: Classe " + c + " — CATMATs (" + str(n) + " PDMs)…"))
-
-            _log_pdm = lambda m: self._log("  🔍 " + m, "info")
-            df_cat1, erros1 = buscar_catmats_por_pdm(pdms_lista, URL_BASE, TIMEOUT, self, log_fn=_log_pdm)
-            df_cat2 = None; erros2 = []
-            if erros1 and not cancelar_busca_catmat:
-                n_e1 = len(erros1)
-                self._ui(lambda n=n_e1:
-                    self._log("♻️  2ª tentativa (10s) para " + str(n) + " PDMs com erro…", "warn"))
-                time.sleep(3)
-                df_cat2, erros2 = buscar_catmats_por_pdm(erros1, URL_BASE, TIMEOUT, self, log_fn=_log_pdm)
-            # 3ª tentativa para PDMs que ainda falharam
-            df_cat3 = None; erros3 = []
-            if erros2 and not cancelar_busca_catmat:
-                n_e2 = len(erros2)
-                self._ui(lambda n=n_e2:
-                    self._log("♻️  3ª tentativa (20s) para " + str(n) + " PDMs com erro…", "warn"))
-                time.sleep(8)
-                df_cat3, erros3 = buscar_catmats_por_pdm(erros2, URL_BASE, TIMEOUT, self, log_fn=_log_pdm)
-                if erros3:
-                    falha_pdm = ", ".join(map(str, erros3))
-                    self._ui(lambda t=falha_pdm:
-                        self._log("❌  PDMs sem resposta após 3 tentativas: " + t, "err"))
-
-            dfs_c = [d for d in [df_cat1, df_cat2, df_cat3] if d is not None and not d.empty]
-            df_catmats = pd.concat(dfs_c, ignore_index=True) if dfs_c else None
-            if df_catmats is None or "codigoItem" not in df_catmats.columns:
-                self._ui(lambda c=classe:
-                    self._log("⚠️  Classe " + c + ": nenhum CATMAT. Pulando.", "warn"))
-                return True   # PDMs foram encontrados mas sem CATMATs — não é falha de PDMs
-
-            catmats_lista = df_catmats["codigoItem"].dropna().astype(int).tolist()
-            n_cat = len(catmats_lista)
-            self._ui(lambda c=classe, n=n_cat:
-                self._log("✅  Classe " + c + ": " + str(n) + " CATMATs.", "ok"))
+        # ── Helper: extrai os Registros de Preços de uma lista de códigos ─────
+        # (CATMATs quando tipo_busca=TIPO_CATMAT, PDMs quando TIPO_PDM)
+        def _extrair_codigos(classe, idx_c, total_c, codigos_lista):
 
             # ── 3. Extração dos Registros de Preços ───────────────────────────
             nome_arq = "classe_" + classe + "." + ext
@@ -1619,7 +1754,7 @@ class App(ctk.CTk):
             total_baixados_classe = 0
             vazios_classe         = 0
             catmats_com_erro      = []
-            total_cat  = len(catmats_lista)
+            total_cat  = len(codigos_lista)
             writer_lock = threading.Lock()
             state_lock  = threading.Lock()
             comp_count  = [0]
@@ -1678,13 +1813,14 @@ class App(ctk.CTk):
                      self.lbl_pct.configure(text=str(int(p*100)) + "%")))
                 return tipo
 
-            # Extração paralela (4 workers)
+            # Extração sequencial (max_workers=1 — paralelismo sobrecarrega a API)
             with ThreadPoolExecutor(max_workers=1) as executor:
                 futures = {
                     executor.submit(_fetch_catmat_registros, cod,
                                     d_ini, d_fim, salvar_corr, pasta_corr,
-                                    self._pausar_por_conexao): cod
-                    for cod in catmats_lista
+                                    self._pausar_por_conexao, tipo_busca,
+                                    lambda: not self.processing): cod
+                    for cod in codigos_lista
                 }
                 for future in as_completed(futures):
                     pausar_extracao.wait()
@@ -1694,12 +1830,13 @@ class App(ctk.CTk):
                     res = _processar_resultado(cod, dfs_m, tipo, reg_e, pag_c)
                     if res == "conexao": break
 
-            # Retry paralelo dos CATMATs com erro
+            # Retry sequencial dos códigos com erro
+            rotulo = ROTULO_TIPO.get(tipo_busca, "código")
             for espera in [15, 30]:
                 if not catmats_com_erro or not self.processing: break
                 n_err = len(catmats_com_erro)
-                self._ui(lambda n=n_err, e=espera:
-                    self._log("♻️  Retry " + str(n) + " CATMAT(s) com erro (aguardando " +
+                self._ui(lambda n=n_err, e=espera, rt=rotulo:
+                    self._log("♻️  Retry " + str(n) + " " + rt + "(s) com erro (aguardando " +
                               str(e) + "s)…", "warn"))
                 time.sleep(espera)
                 retry_list = list(catmats_com_erro); catmats_com_erro.clear()
@@ -1707,7 +1844,8 @@ class App(ctk.CTk):
                     futures = {
                         executor.submit(_fetch_catmat_registros, cod,
                                         d_ini, d_fim, salvar_corr, pasta_corr,
-                                        self._pausar_por_conexao): cod
+                                        self._pausar_por_conexao, tipo_busca,
+                                        lambda: not self.processing): cod
                         for cod in retry_list
                     }
                     for future in as_completed(futures):
@@ -1717,8 +1855,8 @@ class App(ctk.CTk):
 
             if catmats_com_erro:
                 n_def = len(catmats_com_erro)
-                self._ui(lambda n=n_def:
-                    self._log("❌  " + str(n) + " CATMAT(s) sem resposta após 3 tentativas.", "err"))
+                self._ui(lambda n=n_def, rt=rotulo:
+                    self._log("❌  " + str(n) + " " + rt + "(s) sem resposta após 3 tentativas.", "err"))
 
             if not self.processing: return True
 
@@ -1733,8 +1871,8 @@ class App(ctk.CTk):
             rel_caminho = os.path.join(pasta_dest, rel_nome) if pasta_dest else rel_nome
             try:
                 wb = Workbook(); ws = wb.active; ws.title = "Integridade_" + classe
-                ws.append(["codigoItemCatalogo","esperados","baixados","paginas","status"])
-                for c in catmats_lista:
+                ws.append([tipo_busca,"esperados","baixados","paginas","status"])
+                for c in codigos_lista:
                     bx = int(reg_baixados.get(c, 0))
                     ex = int(reg_esperados.get(c, 0))
                     pg = pag_corrompidas.get(c, [])
@@ -1745,7 +1883,7 @@ class App(ctk.CTk):
                     ws.append([c, ex, bx, ", ".join(map(str, pg)), st])
                 if catmats_com_erro:
                     ws.append([])
-                    ws.append(["--- CATMATs sem resposta apos 3 tentativas ---"])
+                    ws.append(["--- " + rotulo + "s sem resposta apos 3 tentativas ---"])
                     for c in catmats_com_erro:
                         ws.append([c, 0, 0, "", "ERRO_API_PERSISTENTE"])
                 wb.save(rel_caminho)
@@ -1755,6 +1893,73 @@ class App(ctk.CTk):
                 etxt = "⚠️ Relatório classe " + classe + " não salvo: " + str(e)
                 self._ui(lambda t=etxt: self._log(t, "warn"))
             return True
+
+        # ── Helper: processa uma classe completa ──────────────────────────────
+        def _processar_classe(classe, idx_c, total_c):
+            ic, tc = idx_c, total_c
+            sep = "─" * 50
+            hdr = sep + "\n📦  CLASSE " + classe + "  (" + str(ic) + "/" + str(tc) + ")\n" + sep
+            self._ui(lambda h=hdr: self._log("\n" + h, "date"))
+            self._ui(lambda c=classe, i=ic, t=tc:
+                self.set_status("Status: Classe " + c + " (" + str(i) + "/" + str(t) + ") — PDMs…"))
+
+            # ── 1. PDMs ───────────────────────────────────────────────────────
+            resultado = buscar_pdms_por_classe(int(classe), URL_BASE, TIMEOUT)
+            if resultado is None:
+                return False   # falhou — será retentada
+            df_pdms, _ = resultado
+            pdms_lista  = df_pdms["codigoPdm"].astype(int).tolist()
+            n_pdms = len(pdms_lista)
+            self._ui(lambda c=classe, n=n_pdms:
+                self._log("✅  Classe " + c + ": " + str(n) + " PDMs.", "ok"))
+
+            # ── 2. CATMATs ────────────────────────────────────────────────────
+            # No modo tipo=codigoPdm a expansão PDM → CATMAT é desnecessária:
+            # a própria Pesquisa de Preço devolve todos os itens do PDM.
+            if tipo_busca == TIPO_PDM:
+                self._ui(lambda c=classe, n=n_pdms:
+                    self._log("⏩  Classe " + c + ": extração direta de " + str(n) +
+                              " PDMs (sem expandir CATMATs).", "info"))
+                return _extrair_codigos(classe, idx_c, total_c, pdms_lista)
+
+            self._ui(lambda c=classe, n=n_pdms:
+                self.set_status("Status: Classe " + c + " — CATMATs (" + str(n) + " PDMs)…"))
+
+            _log_pdm = lambda m: self._log("  🔍 " + m, "info")
+            df_cat1, erros1 = buscar_catmats_por_pdm(pdms_lista, URL_BASE, TIMEOUT, self, log_fn=_log_pdm)
+            df_cat2 = None; erros2 = []
+            if erros1 and not cancelar_busca_catmat:
+                n_e1 = len(erros1)
+                self._ui(lambda n=n_e1:
+                    self._log("♻️  2ª tentativa (10s) para " + str(n) + " PDMs com erro…", "warn"))
+                time.sleep(3)
+                df_cat2, erros2 = buscar_catmats_por_pdm(erros1, URL_BASE, TIMEOUT, self, log_fn=_log_pdm)
+            # 3ª tentativa para PDMs que ainda falharam
+            df_cat3 = None; erros3 = []
+            if erros2 and not cancelar_busca_catmat:
+                n_e2 = len(erros2)
+                self._ui(lambda n=n_e2:
+                    self._log("♻️  3ª tentativa (20s) para " + str(n) + " PDMs com erro…", "warn"))
+                time.sleep(8)
+                df_cat3, erros3 = buscar_catmats_por_pdm(erros2, URL_BASE, TIMEOUT, self, log_fn=_log_pdm)
+                if erros3:
+                    falha_pdm = ", ".join(map(str, erros3))
+                    self._ui(lambda t=falha_pdm:
+                        self._log("❌  PDMs sem resposta após 3 tentativas: " + t, "err"))
+
+            dfs_c = [d for d in [df_cat1, df_cat2, df_cat3] if d is not None and not d.empty]
+            df_catmats = pd.concat(dfs_c, ignore_index=True) if dfs_c else None
+            if df_catmats is None or "codigoItem" not in df_catmats.columns:
+                self._ui(lambda c=classe:
+                    self._log("⚠️  Classe " + c + ": nenhum CATMAT. Pulando.", "warn"))
+                return True   # PDMs foram encontrados mas sem CATMATs — não é falha de PDMs
+
+            catmats_lista = df_catmats["codigoItem"].dropna().astype(int).tolist()
+            n_cat = len(catmats_lista)
+            self._ui(lambda c=classe, n=n_cat:
+                self._log("✅  Classe " + c + ": " + str(n) + " CATMATs.", "ok"))
+
+            return _extrair_codigos(classe, idx_c, total_c, catmats_lista)
 
         # ── Loop principal por classe ─────────────────────────────────────────
         for idx_classe, classe in enumerate(classes_lista, 1):
@@ -1814,13 +2019,15 @@ class App(ctk.CTk):
             messagebox.showinfo("Concluído", "Extração finalizada!")
 
         # ── MOTOR DE EXTRAÇÃO ─────────────────────────────────────────────────────
-    def _iniciar_processo(self, codigos, fmt, d_ini, d_fim, catmats_por_classe=None):
+    def _iniciar_processo(self, codigos, fmt, d_ini, d_fim, catmats_por_classe=None,
+                          tipo=TIPO_CATMAT):
         if not codigos: return
         self.processing            = True
         self.codigos_lista         = codigos
         self._data_inicio          = d_ini
         self._data_fim             = d_fim
         self._fmt                  = fmt
+        self._tipo_busca           = tipo
         self._catmats_por_classe_ativo = catmats_por_classe or {}
         # Pasta escolhida pelo usuário para salvar os arquivos por classe
         self._pasta_classes_destino = self.var_pasta_classes.get().strip()             if hasattr(self, "var_pasta_classes") else ""
@@ -1852,6 +2059,7 @@ class App(ctk.CTk):
             if d_ini: txt += f"  Início: {fd(d_ini)}"
             if d_fim:  txt += f"  Fim: {fd(d_fim)}"
             self._log(txt, "date")
+        self._log(f"🎯 Tipo de busca: {ROTULO_TIPO.get(tipo, tipo)}  (tipo={tipo})", "info")
         self._log(f"🔎 {len(codigos)} códigos carregados.\n", "info")
 
         for k, v in [("k_proc",f"0 / {len(codigos)}"),
@@ -1904,6 +2112,7 @@ class App(ctk.CTk):
         pasta_corr  = self.var_pasta.get()
         d_ini       = self._data_inicio
         d_fim       = self._data_fim
+        tipo_busca  = getattr(self, "_tipo_busca", TIPO_CATMAT)
         writer_locks: dict = {}   # id(writer) → Lock
         state_lock  = threading.Lock()
         comp_count  = [0]
@@ -1919,7 +2128,8 @@ class App(ctk.CTk):
             futures = {
                 executor.submit(_fetch_catmat_registros, cod,
                                 d_ini, d_fim, salvar_corr, pasta_corr,
-                                self._pausar_por_conexao): cod
+                                self._pausar_por_conexao, tipo_busca,
+                                lambda: not self.processing): cod
                 for cod in codigos
             }
             for future in as_completed(futures):
@@ -2008,7 +2218,8 @@ class App(ctk.CTk):
         # Relatório de integridade
         try:
             wb = Workbook(); ws = wb.active; ws.title = "Relatorio Integridade"
-            ws.append(["codigoItemCatalogo","esperados","baixados","paginas","status"])
+            ws.append([getattr(self, "_tipo_busca", TIPO_CATMAT),
+                       "esperados","baixados","paginas","status"])
             for c in self.codigos_lista:
                 bx = int(self.registros_baixados.get(c,0))
                 ex = int(self.registros_esperados.get(c,0))
@@ -2095,551 +2306,6 @@ class App(ctk.CTk):
                     f"Dados salvos em:\n{dest}\n\nRelatorio de integridade na pasta do programa.")
             else:
                 messagebox.showwarning("Atencao", f"Arquivo permanece em:\n{ultimo}")
-
-# =============================================================================
-# PALETA  —  neutros Gov.br + acento azul Gov + verde BPS + amarelo BPS
-# =============================================================================
-C_BG         = "#F4F5F7"   # cinza-papel (fundo geral)
-C_SURFACE    = "#FFFFFF"   # branco (cards / frames)
-C_BORDER     = "#DDE1E9"   # borda sutil
-C_TEXT       = "#1A1D23"   # quase-preto
-C_TEXT_MED   = "#555B6E"   # texto secundário
-C_TEXT_LIGHT = "#8A92A6"   # placeholder / hint
-C_ACCENT     = "#1351B4"   # azul Gov.br (primário)
-C_ACCENT_H   = "#0C3784"   # hover do azul
-C_GREEN      = "#168821"   # verde BPS (sucesso)
-C_GREEN_H    = "#0E5C17"   # hover verde
-C_YELLOW     = "#FFCD07"   # amarelo BPS (destaque / faixa)
-C_ORANGE     = "#E37222"   # aviso
-C_RED        = "#C0392B"   # erro / cancelar
-C_LOG_BG     = "#13141A"   # terminal escuro
-C_LOG_FG     = "#E8EAF0"   # texto terminal
-
-ctk.set_appearance_mode("light")
-ctk.set_default_color_theme("blue")
-
-# =============================================================================
-# LÓGICA DE NEGÓCIO
-# =============================================================================
-
-pausar_extracao     = threading.Event()
-pausar_busca_catmat = threading.Event()
-cancelar_busca_catmat = False
-
-requests.packages.urllib3.disable_warnings(
-    requests.packages.urllib3.exceptions.InsecureRequestWarning
-)
-
-# Session compartilhada — reutiliza conexões TCP/TLS entre todas as requisições
-# Evita o overhead de handshake (~200-400ms) a cada chamada
-_http = requests.Session()
-_http.verify = False
-_http.headers.update({"Accept-Encoding": "gzip, deflate", "Connection": "keep-alive"})
-_adapter = requests.adapters.HTTPAdapter(
-    pool_connections=4, pool_maxsize=12, max_retries=0
-)
-_http.mount("https://", _adapter)
-_http.mount("http://",  _adapter)
-
-URL_BASE = "https://dadosabertos.compras.gov.br"
-TIMEOUT  = 120
-
-ordem_final_colunas = [
-    "idCompra","idItemCompra","forma","modalidade","criterioJulgamento",
-    "numeroItemCompra","descricaoItem","codigoItemCatalogo","nomeUnidadeFornecimento",
-    "siglaUnidadeFornecimento","nomeUnidadeMedida","capacidadeUnidadeFornecimento","siglaUnidadeMedida",
-    "Unidade de Fornecimento","capacidade","quantidade","precoUnitario","Preco Total","percentualMaiorDesconto",
-    "niFornecedor","nomeFornecedor","marca","codigoUasg","nomeUasg",
-    "codigoMunicipio","municipio","estado","codigoOrgao","nomeOrgao",
-    "poder","esfera","dataCompra","dataHoraAtualizacaoCompra","dataHoraAtualizacaoItem",
-    "dataResultado","dataHoraAtualizacaoUasg","codigoClasse","nomeClasse",
-]
-
-
-class ExcelChunkWriter:
-    def __init__(self, base_filename, sheet_name="Dados CATMAT", max_rows_per_file=1_000_000):
-        self.base_filename = base_filename
-        self.sheet_name    = sheet_name
-        self.max_rows      = max_rows_per_file
-        self.part          = 1
-        self.header: List[str] = []
-        self.current_row_count = 0
-        self.files_saved: List[str] = []
-        self._new_workbook()
-
-    def _filepath(self):
-        base, ext = os.path.splitext(self.base_filename)
-        if not ext or ext.lower() != ".xlsx": ext = ".xlsx"
-        return f"{base}_part{self.part}{ext}"
-
-    def _new_workbook(self):
-        self.wb = Workbook(); self.ws = self.wb.active
-        self.ws.title = self.sheet_name
-        self.header_written = False; self.current_row_count = 0
-
-    def _ensure_header(self, columns):
-        if not self.header: self.header = list(columns)
-        if not self.header_written:
-            self.ws.append(self.header); self.header_written = True
-
-    def _rollover_if_needed(self):
-        if self.current_row_count + 1 > self.max_rows:
-            path = self._filepath(); self.wb.save(path); self.files_saved.append(path)
-            self.part += 1; self._new_workbook()
-            if self.header: self.ws.append(self.header); self.header_written = True
-
-    def write_dataframe(self, df: pd.DataFrame):
-        if df is None or df.empty: return
-        self._ensure_header(list(df.columns))
-        for col in self.header:
-            if col not in df.columns: df[col] = pd.NA
-        df = df[self.header]
-        for _, row in df.iterrows():
-            self._rollover_if_needed()
-            self.ws.append([None if pd.isna(v) else v for v in row])
-            self.current_row_count += 1
-
-    def finalize(self) -> List[str]:
-        if self.header_written and self.current_row_count > 0:
-            path = self._filepath(); self.wb.save(path)
-            if path not in self.files_saved: self.files_saved.append(path)
-        return self.files_saved
-
-
-class CSVChunkWriter:
-    def __init__(self, base_filename, sep=";", encoding="utf-8-sig", max_rows_per_file=1_000_000):
-        self.base_filename = base_filename; self.sep = sep
-        self.encoding = encoding; self.max_rows = max_rows_per_file
-        self.part = 1; self.current_row_count = 0
-        self.files_saved: List[str] = []; self.header_written = False
-
-    def _filepath(self):
-        base, ext = os.path.splitext(self.base_filename)
-        if not ext or ext.lower() != ".csv": ext = ".csv"
-        return f"{base}_part{self.part}{ext}"
-
-    def write_dataframe(self, df: pd.DataFrame):
-        if df is None or df.empty: return
-        if self.current_row_count + len(df) > self.max_rows:
-            self.part += 1; self.current_row_count = 0; self.header_written = False
-        path = self._filepath()
-        df.to_csv(path, sep=self.sep, index=False,
-                  mode="a" if self.header_written else "w",
-                  header=not self.header_written, encoding=self.encoding)
-        self.header_written = True; self.current_row_count += len(df)
-        if path not in self.files_saved: self.files_saved.append(path)
-
-    def finalize(self) -> List[str]:
-        return self.files_saved
-
-
-def converter_data_para_api(data_dd_mm_yyyy: str) -> Optional[str]:
-    s = data_dd_mm_yyyy.strip()
-    if not s: return None
-    try:
-        p = s.split("-")
-        if len(p) != 3: return None
-        dd, mm, yyyy = p
-        if len(dd) == 2 and len(mm) == 2 and len(yyyy) == 4:
-            int(dd); int(mm); int(yyyy)
-            return f"{yyyy}-{mm}-{dd}"
-    except (ValueError, AttributeError):
-        pass
-    return None
-
-
-def validar_e_obter_datas(ini: str, fim: str):
-    i_api = f_api = None
-    if ini.strip():
-        i_api = converter_data_para_api(ini)
-        if i_api is None:
-            return None, None, f"Data de Inicio invalida: '{ini}'\nUse DD-MM-AAAA (ex: 01-01-2024)"
-    if fim.strip():
-        f_api = converter_data_para_api(fim)
-        if f_api is None:
-            return None, None, f"Data Final invalida: '{fim}'\nUse DD-MM-AAAA (ex: 31-12-2024)"
-    return i_api, f_api, None
-
-
-def parse_csv_text(csv_text: str) -> pd.DataFrame:
-    # Remove linhas vazias e artefatos de aspas soltas (ex: linha contendo só '"')
-    # que surgem quando um campo de texto contém quebras de linha internas
-    lines = [ln for ln in csv_text.splitlines()
-             if ln.strip() and ln.strip().strip('"').strip() != ""]
-    if not lines: return pd.DataFrame()
-    try:
-        # QUOTE_MINIMAL respeita aspas duplas como delimitadores de campo,
-        # tratando corretamente campos que contêm ponto-e-vírgula ou quebras de linha
-        return pd.read_csv(StringIO("\n".join(lines)), sep=";", dtype=str,
-                           engine="python", on_bad_lines="skip",
-                           quoting=csv.QUOTE_MINIMAL)
-    except Exception:
-        return pd.DataFrame()
-
-
-def ler_pagina_catmat(codigo, pagina, URL_BASE, TAMANHO_PAGINA, TIMEOUT,
-                      data_compra_inicio=None, data_compra_fim=None):
-    URL = f"{URL_BASE}/modulo-pesquisa-preco/1.1_consultarMaterial_CSV"
-    params = {"tamanhoPagina": TAMANHO_PAGINA, "codigoItemCatalogo": int(codigo), "pagina": int(pagina)}
-    if data_compra_inicio: params["dataCompraInicio"] = data_compra_inicio
-    if data_compra_fim:    params["dataCompraFim"]    = data_compra_fim
-    tentativas = 0
-    while tentativas < 2:
-        try:
-            resp = _http.get(URL, params=params, timeout=TIMEOUT)
-            if resp.status_code == 429:
-                time.sleep(15 if tentativas == 0 else 30); tentativas += 1; continue
-            resp.raise_for_status()
-            return None, resp.content.decode("utf-8-sig", errors="replace")
-        except requests.exceptions.ConnectionError as e:
-            return None, f"ERRO_CONEXAO: {e}"
-        except requests.exceptions.RequestException as e:
-            return None, f"ERRO_REQUISICAO: {e}"
-    return None, f"ERRO_REQUISICAO: 429 persistente para CATMAT {codigo}"
-
-
-def _normalizar_campo(item: dict, *candidatos, default=""):
-    """Retorna o primeiro campo encontrado no dict entre os candidatos."""
-    for c in candidatos:
-        if c in item and item[c] is not None:
-            return item[c]
-    return default
-
-
-def buscar_pdms_por_classe(codigo_classe: int, URL_BASE: str, TIMEOUT: int):
-    URL = f"{URL_BASE}/modulo-material/3_consultarPdmMaterial"
-    all_pdms = []; pagina_atual = 1; total_paginas = 1; total_registros_api = 0
-    TAMANHO_PAGINA = 500
-    while pagina_atual <= total_paginas:
-        try:
-            resp = _http.get(URL, params={
-                "codigoClasse": codigo_classe, "pagina": pagina_atual,
-                "tamanhoPagina": TAMANHO_PAGINA, "bps": "false"
-            }, timeout=TIMEOUT)
-            resp.raise_for_status(); data = resp.json()
-            if "resultado" in data:
-                # Logar as keys do primeiro item para diagnóstico
-                if pagina_atual == 1 and data["resultado"]:
-                    print(f"DEBUG keys PDM: {list(data['resultado'][0].keys())}")
-                    print(f"DEBUG primeiro item: {data['resultado'][0]}")
-                all_pdms.extend(data["resultado"])
-            if pagina_atual == 1:
-                total_registros_api = int(data.get("totalRegistros", 0))
-                total_paginas = math.ceil(total_registros_api / TAMANHO_PAGINA) if total_registros_api > 0 else 1
-                print(f"DEBUG: Registros: {total_registros_api} | Paginas: {total_paginas}")
-            pagina_atual += 1; time.sleep(0.5)
-        except Exception as e:
-            print(f"DEBUG erro busca classe {codigo_classe}: {e}")
-            return None
-    if not all_pdms: return None
-
-    # Normalizar campos — a API pode retornar nomes variados
-    rows_norm = []
-    for item in all_pdms:
-        cod  = _normalizar_campo(item, "codigoPdm", "codigo", "id", "codigoItem")
-        desc = _normalizar_campo(item, "nomePdm", "nome", "descricao", "descricaoPdm", "descricaoItem")
-        # status pode ser bool True/False, string "ATIVO"/"INATIVO", ou inteiro
-        raw_status = _normalizar_campo(item, "statusPdm", "status", "ativo", "situacao")
-        if isinstance(raw_status, bool):
-            status = "Ativo" if raw_status else "Inativo"
-        elif isinstance(raw_status, str):
-            status = "Ativo" if raw_status.upper() in ("ATIVO", "TRUE", "S", "SIM", "1") else "Inativo"
-        elif isinstance(raw_status, (int, float)):
-            status = "Ativo" if raw_status == 1 else "Inativo"
-        else:
-            status = "Ativo"
-        rows_norm.append({"codigoPdm": cod, "nomePdm": desc, "statusPdm": status,
-                          "_classe": str(codigo_classe)})
-
-    df = pd.DataFrame(rows_norm).drop_duplicates(subset=["codigoPdm"])
-    return df, total_registros_api
-
-
-def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
-                           log_fn=None, max_workers=5):
-    """
-    Busca CATMATs de múltiplos PDMs em paralelo usando ThreadPoolExecutor.
-    max_workers=5 → ~5x mais rápido sem sobrecarregar a API.
-    """
-    global cancelar_busca_catmat
-    URL   = f"{URL_BASE}/modulo-material/4_consultarItemMaterial"
-    total = len(codigos_pdm)
-    all_catmats  = []
-    pdms_com_erro = []
-    completed     = 0
-    lock          = threading.Lock()   # protege all_catmats e pdms_com_erro
-
-    def _fetch_pdm(idx_pdm):
-        """Worker: busca todas as páginas de CATMATs de um PDM."""
-        i, pdm_code = idx_pdm
-        if cancelar_busca_catmat:
-            return
-        resultados = []; pagina_atual = 1; total_paginas = 1
-        try:
-            while pagina_atual <= total_paginas:
-                if cancelar_busca_catmat: break
-                resp = _http.get(URL, params={
-                    "codigoPdm": pdm_code, "pagina": pagina_atual,
-                    "tamanhoPagina": 500, "bps": "false"
-                }, timeout=TIMEOUT)
-                if resp.status_code == 429:
-                    time.sleep(15); continue          # rate-limit: aguarda e repete
-                resp.raise_for_status()
-                data = resp.json()
-                if "resultado" in data:
-                    resultados.extend(data["resultado"])
-                if pagina_atual == 1:
-                    total_paginas = data.get("totalPaginas", 1)
-                pagina_atual += 1
-                if pagina_atual <= total_paginas:
-                    time.sleep(0.2)                   # throttle entre páginas do mesmo PDM
-        except Exception:
-            with lock:
-                pdms_com_erro.append(pdm_code)
-            return
-        if resultados:
-            with lock:
-                all_catmats.extend(resultados)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_fetch_pdm, (i, pdm)): (i, pdm)
-            for i, pdm in enumerate(codigos_pdm)
-        }
-        for future in as_completed(futures):
-            pausar_busca_catmat.wait()        # respeita pausa
-            if cancelar_busca_catmat:
-                app.after(0, lambda: app.set_status_explorador("Busca cancelada."))
-                executor.shutdown(wait=False, cancel_futures=True)
-                break
-            completed += 1
-            i, pdm_code = futures[future]
-            msg = f"PDM {pdm_code} ({completed}/{total})..."
-            app.after(0, lambda m=msg: app.set_status_explorador(m))
-            if log_fn and (completed % 5 == 0 or completed == total):
-                app.after(0, lambda m=msg: log_fn(m))
-
-    return pd.DataFrame(all_catmats) if all_catmats else None, pdms_com_erro
-
-
-def pagina_corrompida(csv_text: str):
-    """
-    Detecta e corrige dois tipos de corrupção no CSV da API:
-    1. Linhas fragmentadas (< ncols campos) — campos com \n interno
-    2. Linhas com aspas soltas (campo contendo só '"') — artefato de \n em campo com aspas
-    Retorna (houve_correcao, csv_corrigido).
-    """
-    if not csv_text: return False, csv_text
-    linhas = [ln for ln in csv_text.splitlines() if ln.strip()]
-    if not linhas: return False, csv_text
-    try:
-        hi = next(i for i, ln in enumerate(linhas)
-                  if not ln.lower().startswith(("totalregistros:", "totalpaginas:")))
-        header_line = linhas[hi]
-        ncols = len(header_line.split(";"))
-    except StopIteration:
-        return False, csv_text
-    if ncols == 0: return False, csv_text
-
-    out = list(linhas[:hi]) + [header_line]
-    buf = ""; corrigido = False
-
-    for ln in linhas[hi+1:]:
-        if ln.lower().startswith(("totalregistros:", "totalpaginas:")):
-            if buf: out.append(buf); buf = ""
-            out.append(ln); continue
-
-        # Descartar artefatos de aspas soltas (tipo 2)
-        if ln.strip().strip('"').strip() == "":
-            corrigido = True; continue
-
-        atual = (buf + " " + ln).strip() if buf else ln
-        n = len(atual.split(";"))
-
-        if n < ncols:
-            # Fragmento — acumular (tipo 1)
-            buf = atual; corrigido = True
-        elif n == ncols:
-            out.append(atual); buf = ""
-        else:
-            # Excesso de colunas: se a linha sozinha tem ncols, usar ela diretamente
-            if len(ln.split(";")) == ncols:
-                if buf: corrigido = True
-                out.append(ln); buf = ""
-            else:
-                # Manter como está — parse_csv_text vai lidar com on_bad_lines="skip"
-                out.append(atual); buf = ""; corrigido = True
-
-    if buf: out.append(buf)
-    return corrigido, "\n".join(out)
-
-
-def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.DataFrame:
-    if df.empty: return df
-    fc = df.columns[0]
-    df = df[~df[fc].astype(str).str.contains("totalRegistros|totalPaginas",
-                                              case=False, na=False)].copy()
-    if df.empty: return df
-
-    # Mapa sigla → nome completo para preencher nomeUnidadeFornecimento ausente
-    _SIGLA_NOME = {
-        "FR-AM": "Frasco-Ampola", "FR": "Frasco", "CAPS": "Cápsula",
-        "COMPR": "Comprimido", "AM": "Ampola", "UN": "Unidade",
-        "SER": "Seringa", "BIS": "Bisnaga", "BLIS": "Blister",
-        "BOL": "Bolsa", "BOM": "Bombona", "CA": "Cartucho",
-        "CI": "Curie", "CJ": "Conjunto", "DOSE(S)": "Dose(s)",
-        "DOSES": "Dose(s)", "DRAG": "Drágea", "EMB": "Embalagem",
-        "EMP": "Emplastro", "ENV": "Envelope", "FLAC": "Flaconete",
-        "G": "Grama", "GL": "Galão", "GLOB": "Glóbulo",
-        "KG": "Quilograma", "L": "Litro", "MCG": "Micrograma",
-        "MCU": "Milicurie", "MG": "Miligrama",
-        "MIL CTE": "Milheiro de Cartelas", "ML": "Mililitro",
-        "PAST": "Pastilha", "POTE": "Pote", "RO": "Rolo",
-        "SAC": "Sachê", "SUP": "Supositório", "TAB": "Tablete",
-        "TBO": "Tubo", "TBTE": "Tubete", "UI": "Unid. Internacional",
-    }
-
-    def _val(row, col):
-        v = row.get(col)
-        s = str(v).strip() if pd.notna(v) else ""
-        return "" if s in ("", "nan", "None", "null") else s
-
-    def uf(row):
-        nome  = _val(row, "nomeUnidadeFornecimento")
-        sigla = _val(row, "siglaUnidadeFornecimento")
-        cap   = _val(row, "capacidadeUnidadeFornecimento")
-        medi  = _val(row, "siglaUnidadeMedida")
-
-        # Se nomeUnidade vazio, tentar preencher pela sigla
-        if not nome and sigla:
-            nome = _SIGLA_NOME.get(sigla.upper(), sigla)
-
-        # capacidade: ignorar se for 0,00 ou 0.00 ou 0
-        try:
-            cap_num = float(cap.replace(".", "").replace(",", ".")) if cap else 0
-        except Exception:
-            cap_num = 0
-        cap_valida = bool(cap) and cap_num != 0
-
-        # Montar: Nome + capacidade + siglaUnidadeMedida
-        # Se não houver capacidade válida, ignorar também siglaUnidadeMedida
-        partes = [nome] if nome else []
-        if cap_valida:
-            partes.append(cap)
-            if medi:
-                partes.append(medi)
-        return " ".join(partes)
-
-    df["Unidade de Fornecimento"] = df.apply(uf, axis=1)
-
-    def tof(v):
-        if pd.isna(v): return 0.0
-        try: return float(str(v).replace(".", "").replace(",", "."))
-        except: return 0.0
-
-    df["Preco Total"] = df["precoUnitario"].apply(tof) * df["quantidade"].apply(tof)
-    for col in ["nomeUnidadeMedida","percentualMaiorDesconto"]:
-        if col in df.columns and (df[col].isnull().all() or
-                                   df[col].astype(str).str.strip().eq("").all()):
-            df = df.drop(columns=[col])
-    exist = [c for c in ordem_colunas if c in df.columns]
-    extra = [c for c in df.columns if c not in exist]
-    return df[exist + extra]
-
-
-# =============================================================================
-# COMPONENTES DE UI  (helpers)
-# =============================================================================
-
-WELCOME = """\
-Olá! Bem-vindo ao Extrator de CATMATs Pro.
-
-Sua ferramenta para extrair e descobrir dados no Portal de Compras Governamentais!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-O que este programa faz?
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Este programa possui duas funcoes principais em abas separadas:
-
-  1. Extracao por CATMAT (esta aba)
-     Se voce ja tem uma lista de codigos de materiais (CATMATs), esta aba
-     busca todas as informacoes de compras, corrige problemas nos dados e
-     consolida tudo em um arquivo Excel ou CSV.
-
-  2. Extracao por Classes (aba ao lado)
-     Se voce quer descobrir novos itens, pode comecar com o codigo de uma
-     ou mais Classes, encontrar todos os Padroes Descritivos de Materiais
-     (PDMs) dentro delas e, em seguida, listar todos os CATMATs relacionados
-     para extracao.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Primeiros Passos
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  - Para uma extracao direta com uma lista pronta, use esta aba.
-    O arquivo Excel ou CSV deve ter a coluna: codigoItemCatalogo
-
-  - Para descobrir itens, use a aba "Extracao por Classes" e, ao final,
-    envie os CATMATs encontrados para a extracao nesta aba.
-
-  - Utilize os filtros de data (DD-MM-AAAA) para restringir os resultados
-    a um periodo especifico de compras (Data de Inicio e Data Final).
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Acompanhe todo o processo em tempo real neste log. Bom trabalho!
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-
-
-def _lbl(parent, text, size=12, weight="normal", color=C_TEXT, **kw):
-    return ctk.CTkLabel(parent, text=text, font=("Segoe UI", size, weight),
-                        text_color=color, **kw)
-
-
-def _btn(parent, text, command, variant="secondary", width=0, **kw):
-    pal = {
-        "primary":   (C_SURFACE,  C_ACCENT,  C_SURFACE,  C_ACCENT_H),
-        "success":   (C_SURFACE,  C_GREEN,   C_SURFACE,  C_GREEN_H),
-        "danger":    (C_SURFACE,  C_RED,     C_SURFACE,  "#992B1E"),
-        "secondary": (C_TEXT,     "#E4E7EF", C_TEXT,     C_BORDER),
-        "ghost":     (C_ACCENT,   "transparent", C_ACCENT_H, "#E8EDF8"),
-    }
-    tc, bg, htc, hbg = pal.get(variant, pal["secondary"])
-    return ctk.CTkButton(parent, text=text, command=command,
-                         font=("Segoe UI", 12), fg_color=bg, text_color=tc,
-                         hover_color=hbg, corner_radius=6,
-                         width=width, height=32, **kw)
-
-
-def _entry(parent, textvariable=None, placeholder="", width=200, **kw):
-    return ctk.CTkEntry(parent, textvariable=textvariable,
-                        placeholder_text=placeholder,
-                        font=("Segoe UI", 12),
-                        fg_color=C_SURFACE, text_color=C_TEXT,
-                        border_color=C_BORDER, border_width=1,
-                        corner_radius=6, width=width,
-                        placeholder_text_color=C_TEXT_LIGHT, **kw)
-
-
-def _sep(parent, pady=(6,6)):
-    ctk.CTkFrame(parent, height=1, fg_color=C_BORDER,
-                 corner_radius=0).pack(fill="x", padx=14, pady=pady)
-
-
-def _card(parent, title="", **kw):
-    outer = ctk.CTkFrame(parent, fg_color=C_SURFACE, corner_radius=8,
-                         border_width=1, border_color=C_BORDER, **kw)
-    if title:
-        _lbl(outer, title, size=11, weight="bold", color=C_TEXT_MED)\
-            .pack(anchor="w", padx=14, pady=(10,4))
-        _sep(outer, pady=(0,6))
-    return outer
-
-
-# =============================================================================
-# APLICATIVO PRINCIPAL
-
 
 # =============================================================================
 if __name__ == "__main__":
