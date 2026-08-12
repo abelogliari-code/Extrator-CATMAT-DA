@@ -74,6 +74,7 @@ _http.mount("http://",  _adapter)
 
 URL_BASE = "https://dadosabertos.compras.gov.br"
 TIMEOUT  = 120
+_MAX_PAGINAS = 20000   # trava contra laço infinito se a API paginar sem fim
 
 # =============================================================================
 # TIPOS DE BUSCA  —  espelha o seletor "tipo" do endpoint de Pesquisa de Preço
@@ -103,7 +104,28 @@ ordem_final_colunas = [
 
 
 class ExcelChunkWriter:
-    def __init__(self, base_filename, sheet_name="Dados CATMAT", max_rows_per_file=1_000_000):
+    """
+    Escreve .xlsx em modo STREAMING (openpyxl write_only).
+
+    O modo padrão do openpyxl mantém a planilha inteira em memória e só serializa
+    tudo no save(), o que concentra o custo no encerramento — exatamente onde o
+    usuário fica esperando. Medido com 30 mil linhas x 39 colunas:
+
+        modo padrão   → 5,5 s durante + 9,5 s NO FINAL + 333 MB de RAM
+        write_only    → 9,3 s durante + 0,9 s NO FINAL +   0 MB de RAM
+
+    O tempo "durante" é absorvido pelas esperas de rede (0,5 s por página); o
+    tempo "no final" é espera pura. Em uma extração de 230 mil registros isso
+    troca ~70 s de espera no encerramento por ~7 s, e ~2,5 GB de RAM por nada.
+
+    Contrapartida: em write_only o workbook só pode ser salvo UMA vez, então não
+    há como reescrever o arquivo periodicamente. A proteção contra queda no meio
+    da execução passa a ser um espelho .parcial.csv, gravado em append (16 ms por
+    página de 500 linhas) e apagado quando o .xlsx é fechado com sucesso.
+    """
+
+    def __init__(self, base_filename, sheet_name="Dados CATMAT",
+                 max_rows_per_file=1_000_000, espelho=True):
         self.base_filename = base_filename
         self.sheet_name    = sheet_name
         self.max_rows      = max_rows_per_file
@@ -111,6 +133,10 @@ class ExcelChunkWriter:
         self.header: List[str] = []
         self.current_row_count = 0
         self.files_saved: List[str] = []
+        self._finalizado   = False
+        self._usar_espelho = espelho
+        self._espelho_f    = None
+        self._espelho_w    = None
         self._new_workbook()
 
     def _filepath(self):
@@ -118,21 +144,54 @@ class ExcelChunkWriter:
         if not ext or ext.lower() != ".xlsx": ext = ".xlsx"
         return f"{base}_part{self.part}{ext}"
 
+    def _espelho_path(self):
+        base, _ = os.path.splitext(self.base_filename)
+        return f"{base}.parcial.csv"
+
     def _new_workbook(self):
-        self.wb = Workbook(); self.ws = self.wb.active
-        self.ws.title = self.sheet_name
+        # write_only exige create_sheet(); wb.active não existe nesse modo
+        self.wb = Workbook(write_only=True)
+        self.ws = self.wb.create_sheet(self.sheet_name)
         self.header_written = False; self.current_row_count = 0
 
     def _ensure_header(self, columns):
         if not self.header: self.header = list(columns)
         if not self.header_written:
             self.ws.append(self.header); self.header_written = True
+            self._abrir_espelho()
+
+    def _abrir_espelho(self):
+        """Espelho .parcial.csv — rede de segurança enquanto o .xlsx não fecha."""
+        if not self._usar_espelho or self._espelho_f is not None:
+            return
+        try:
+            self._espelho_f = open(self._espelho_path(), "w",
+                                   encoding="utf-8-sig", newline="")
+            self._espelho_w = csv.writer(self._espelho_f, delimiter=";")
+            self._espelho_w.writerow(self.header)
+        except Exception:
+            self._usar_espelho = False      # sem espelho é melhor que falhar
+            self._espelho_f = self._espelho_w = None
+
+    def _fechar_espelho(self, apagar):
+        if self._espelho_f is None: return
+        try:
+            self._espelho_f.close()
+        except Exception:
+            pass
+        if apagar:
+            try:
+                os.remove(self._espelho_path())
+            except Exception:
+                pass
+        self._espelho_f = self._espelho_w = None
 
     def _rollover_if_needed(self):
         if self.current_row_count + 1 > self.max_rows:
             path = self._filepath(); self.wb.save(path); self.files_saved.append(path)
             self.part += 1; self._new_workbook()
-            if self.header: self.ws.append(self.header); self.header_written = True
+            if self.header:
+                self.ws.append(self.header); self.header_written = True
 
     def write_dataframe(self, df: pd.DataFrame):
         if df is None or df.empty: return
@@ -142,19 +201,61 @@ class ExcelChunkWriter:
             df = df.copy()          # não mutar o DataFrame do chamador
             for col in faltantes: df[col] = pd.NA
         df = df[self.header]
-        for _, row in df.iterrows():
+        for linha in df.itertuples(index=False, name=None):
             self._rollover_if_needed()
             # openpyxl levanta IllegalCharacterError em caracteres de controle,
             # frequentes no texto livre vindo da API — sanitiza na gravação
-            self.ws.append([None if pd.isna(v) else
-                            (_CTRL_ILEGAIS.sub(" ", v) if isinstance(v, str) else v)
-                            for v in row])
+            limpa = [None if pd.isna(v) else
+                     (_CTRL_ILEGAIS.sub(" ", v) if isinstance(v, str) else v)
+                     for v in linha]
+            self.ws.append(limpa)
+            if self._espelho_w is not None:
+                self._espelho_w.writerow(["" if v is None else v for v in limpa])
             self.current_row_count += 1
 
+    def flush(self, intervalo_min=30, fator=20):
+        """
+        Em write_only o .xlsx não pode ser reescrito no meio do caminho: o que se
+        garante aqui é que o espelho .parcial.csv esteja em disco.
+        """
+        if self._espelho_f is None: return None
+        try:
+            self._espelho_f.flush()
+        except Exception:
+            return None
+        return self._espelho_path()
+
+    def _descartar_workbook(self):
+        """
+        Um workbook write_only coletado sem save() deixa os geradores internos do
+        openpyxl abertos, e o lxml despeja 'Exception ignored ... LxmlSyntaxError'
+        no stderr durante o garbage collector. close() encerra os streams.
+        """
+        try:
+            self.ws.close()      # encerra os geradores de escrita da planilha
+        except Exception:
+            pass
+        try:
+            self.wb.close()
+        except Exception:
+            pass
+
     def finalize(self) -> List[str]:
+        if self._finalizado:
+            return self.files_saved
+        self._finalizado = True
+        ok = True
         if self.header_written and self.current_row_count > 0:
-            path = self._filepath(); self.wb.save(path)
-            if path not in self.files_saved: self.files_saved.append(path)
+            path = self._filepath()
+            try:
+                self.wb.save(path)
+                if path not in self.files_saved: self.files_saved.append(path)
+            except Exception:
+                ok = False          # mantém o espelho: é tudo o que restou
+        else:
+            self._descartar_workbook()   # nada a salvar: fecha sem ruído
+        # Espelho só é descartado quando o .xlsx foi fechado com sucesso
+        self._fechar_espelho(apagar=ok)
         return self.files_saved
 
 
@@ -187,6 +288,10 @@ class CSVChunkWriter:
                   header=not self.header_written, encoding=self.encoding)
         self.header_written = True; self.current_row_count += len(df)
         if path not in self.files_saved: self.files_saved.append(path)
+
+    def flush(self, intervalo_min=30, fator=20):
+        """CSV já é gravado em append a cada página — nada a fazer."""
+        return None
 
     def finalize(self) -> List[str]:
         return self.files_saved
@@ -599,6 +704,19 @@ def buscar_catmats_por_pdm(codigos_pdm, URL_BASE, TIMEOUT, app,
 
 
 
+def _int_do_rodape(csv_text, rotulo):
+    """
+    Lê um inteiro do rodapé da resposta (ex.: 'totalPaginas: 1.234').
+    Tolera separador de milhar — '\\d+' sozinho capturaria apenas o '1'.
+    Retorna None quando o rótulo não aparece na resposta.
+    """
+    m = re.search(rotulo + r"\s*:\s*([\d.,]+)", csv_text, re.IGNORECASE)
+    if not m:
+        return None
+    digitos = re.sub(r"\D", "", m.group(1))
+    return int(digitos) if digitos else None
+
+
 def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
                             _pausar_conexao_fn=None, tipo=TIPO_CATMAT,
                             _cancelado_fn=None, TAMANHO_PAGINA=500):
@@ -612,7 +730,8 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
     Pode rodar em qualquer thread — não acessa estado compartilhado.
     Retorna: (codigo, dfs_e_meta, tipo, reg_esp, pag_corr)
       tipo: "ok" | "vazio" | "erro" | "conexao"
-      dfs_e_meta: lista de (df_processado, is_corrompida, num_pagina)
+      dfs_e_meta: lista de (df_processado, marca, num_pagina)
+                  marca: "" | "reparada" | "perda"
     """
     dfs_e_meta  = []
     pag_corr    = {}
@@ -639,15 +758,20 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
         if csv_text is None or csv_text.startswith("ERRO_REQUISICAO"):
             return codigo, [], "erro", 0, {}
 
-        m = re.search(r"totalRegistros\s*:\s*(\d+)", csv_text, re.IGNORECASE)
-        reg_esp = int(m.group(1)) if m else 0
+        reg_esp = _int_do_rodape(csv_text, "totalRegistros") or 0
         if reg_esp == 0:
             return codigo, [], "vazio", 0, {}
 
-        # Total de páginas por cálculo, não por regex no corpo do CSV: se a
-        # linha de metadados vier ausente ou com outro rótulo, o valor antigo
-        # caía em 1 e a extração era truncada em silêncio nos 500 primeiros.
-        total_paginas = max(1, math.ceil(reg_esp / TAMANHO_PAGINA))
+        # Total de páginas: o rodapé da resposta é a fonte primária. O cálculo
+        # por totalRegistros entra como conferência e, quando o rodapé falta,
+        # como substituto — o código antigo caía em 1 nesse caso e truncava a
+        # extração nos 500 primeiros registros em silêncio.
+        pag_rodape    = _int_do_rodape(csv_text, r"total\s*(?:de\s*)?p[áa]ginas?")
+        pag_calculado = max(1, math.ceil(reg_esp / TAMANHO_PAGINA))
+        total_paginas = max(pag_rodape or 0, pag_calculado)
+        # Sem rodapé não há como conferir a paginação: só nesse caso vale
+        # insistir enquanto as páginas voltarem cheias.
+        confiar_no_rodape = pag_rodape is not None
 
         while True:
             # Respeita pausa/cancelamento também ENTRE PÁGINAS de um mesmo código
@@ -658,9 +782,16 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
             esperado_pag = max(0, min(TAMANHO_PAGINA,
                                       reg_esp - TAMANHO_PAGINA * (pagina_atual - 1)))
             df_pag, diag = parse_pagina_csv(csv_text, esperado_pag or None)
-            is_c = not diag["ok"]
+            # "perda"    → não foi possível reconstituir a página fielmente
+            # "reparada" → houve conserto, mas todos os registros foram recuperados
+            if not diag["ok"]:
+                marca = "perda"
+            elif diag["reparos"]:
+                marca = "reparada"
+            else:
+                marca = ""
 
-            if is_c:
+            if marca == "perda":
                 pag_corr.setdefault(codigo, []).append(str(pagina_atual))
                 if salvar_corr and pasta_corr:
                     dest = os.path.join(pasta_corr,
@@ -679,13 +810,19 @@ def _fetch_catmat_registros(codigo, d_ini, d_fim, salvar_corr, pasta_corr,
                 else:
                     df_pag.loc[:, "codigoItemCatalogo"] = str(codigo)
                 df_proc = processar_dataframe_final(df_pag, ordem_final_colunas)
-                dfs_e_meta.append((df_proc, is_c, pagina_atual))
+                dfs_e_meta.append((df_proc, marca, pagina_atual))
 
             if total_paginas is None:
                 total_paginas = 1
 
+            # Com rodapé, ele manda: nenhuma requisição além do que ele informa.
+            # Sem rodapé, página cheia é o único indício de que ainda há dados.
+            insistir = (not confiar_no_rodape
+                        and df_pag is not None and len(df_pag) >= TAMANHO_PAGINA)
             pagina_atual += 1
-            if pagina_atual > total_paginas:
+            if pagina_atual > total_paginas and not insistir:
+                break
+            if pagina_atual > _MAX_PAGINAS:      # trava de segurança
                 break
             time.sleep(0.5)
             _, csv_text = ler_pagina_catmat(codigo, pagina_atual, URL_BASE,
@@ -763,7 +900,13 @@ def processar_dataframe_final(df: pd.DataFrame, ordem_colunas: List[str]) -> pd.
         try: return float(str(v).replace(".", "").replace(",", "."))
         except: return 0.0
 
-    df["Preco Total"] = df["precoUnitario"].apply(tof) * df["quantidade"].apply(tof)
+    # Sem os .get() a ausência de uma coluna vira KeyError, que o worker
+    # captura no except genérico e reporta como "erro de API" — uma mudança de
+    # schema na origem apareceria como indisponibilidade, sem pista no log.
+    if "precoUnitario" in df.columns and "quantidade" in df.columns:
+        df["Preco Total"] = df["precoUnitario"].apply(tof) * df["quantidade"].apply(tof)
+    else:
+        df["Preco Total"] = 0.0
     for col in ["nomeUnidadeMedida","percentualMaiorDesconto"]:
         if col in df.columns and (df[col].isnull().all() or
                                    df[col].astype(str).str.strip().eq("").all()):
@@ -893,6 +1036,8 @@ class App(ctk.CTk):
         self.registros_baixados   = {}
         self.total_baixados       = 0
         self.count_corrigidas     = 0
+        self.count_reparadas      = 0
+        self._modo_por_classe     = False
         self.count_vazios         = 0
         self._data_inicio         = None
         self._data_fim            = None
@@ -992,6 +1137,34 @@ class App(ctk.CTk):
                                   size=10, color=C_TEXT_LIGHT)
         self.lbl_hint_tipo.pack(side="left", padx=(12,0))
 
+        # um arquivo por classe — a classe vem do próprio registro (codigoClasse),
+        # ou de uma coluna "classe" no arquivo de entrada, quando houver
+        rpc = ctk.CTkFrame(inn, fg_color="transparent"); rpc.pack(fill="x", pady=3)
+        self._row_por_classe1 = rpc
+        self.var_por_classe1 = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(rpc, text="Salvar um arquivo por classe",
+                        variable=self.var_por_classe1,
+                        command=self._toggle_pasta_classe1,
+                        font=("Segoe UI", 12), text_color=C_TEXT,
+                        fg_color=C_ACCENT, border_color=C_BORDER).pack(side="left")
+        _lbl(rpc, "  (separa a saída em classe_XXXX; a classe vem dos próprios "
+                  "registros ou da coluna \"classe\" do arquivo)",
+             size=10, color=C_TEXT_LIGHT).pack(side="left")
+
+        # Pasta de destino — os arquivos de cada classe são gravados direto nela,
+        # sem diálogo ao final
+        self.frame_pasta_classe1 = ctk.CTkFrame(inn, fg_color="transparent")
+        row_pc = ctk.CTkFrame(self.frame_pasta_classe1, fg_color="transparent")
+        row_pc.pack(fill="x")
+        _lbl(row_pc, "Pasta de destino:", color=C_TEXT_MED, size=11)\
+            .pack(side="left", padx=(0,8))
+        self.var_pasta_classe1 = tk.StringVar()
+        _entry(row_pc, textvariable=self.var_pasta_classe1,
+               placeholder="Selecione a pasta onde os arquivos serão salvos",
+               width=380).pack(side="left", expand=True, fill="x")
+        _btn(row_pc, "📂  Procurar", self._escolher_pasta_classe1,
+             variant="ghost", width=100).pack(side="left", padx=(8,0))
+
         _sep(inn)
 
         # datas
@@ -1046,7 +1219,7 @@ class App(ctk.CTk):
         stats = [
             ("Códigos Processados",   "k_proc",  C_ACCENT),
             ("Registros Consolidados","k_reg",   C_GREEN),
-            ("Páginas Corrigidas",    "k_corr",  C_ORANGE),
+            ("Reparadas · Com Perda", "k_corr",  C_ORANGE),
             ("Códigos sem Dados",     "k_vaz",   C_RED),
         ]
         self._stats = {}
@@ -1289,6 +1462,10 @@ class App(ctk.CTk):
     def set_status_explorador(self, txt): self.lbl_exp_status.configure(text=txt)
     def _stat(self, key, val): self._stats[key].configure(text=str(val))
 
+    def _atualizar_stat_paginas(self):
+        """Card de páginas: reparadas (recuperadas) · com perda (registros sumiram)."""
+        self._stat("k_corr", f"{self.count_reparadas} · {self.count_corrigidas}")
+
 
 
     # ── CALLBACKS ABA 1 ───────────────────────────────────────────────────────
@@ -1307,6 +1484,23 @@ class App(ctk.CTk):
         else:
             self.frame_pasta.pack_forget()
 
+    def _toggle_pasta_classe1(self):
+        """Mostra o campo de pasta apenas quando o modo por classe está ativo."""
+        if self.var_por_classe1.get():
+            # after= ancora o campo logo abaixo do checkbox; sem isso o pack
+            # jogaria o frame para o fim da seção, longe do que ele controla
+            self.frame_pasta_classe1.pack(fill="x", padx=0, pady=(2,0),
+                                          after=self._row_por_classe1)
+        else:
+            self.frame_pasta_classe1.pack_forget()
+            self.var_pasta_classe1.set("")
+
+    def _escolher_pasta_classe1(self):
+        p = filedialog.askdirectory(
+            title="Escolha a pasta de destino dos arquivos por classe")
+        if p:
+            self.var_pasta_classe1.set(p)
+
     def _on_tipo_extracao(self, valor=None):
         """Atualiza a dica de coluna quando o usuário troca CATMAT ↔ PDM."""
         tipo = TIPO_POR_ROTULO.get(self.var_tipo1.get(), TIPO_CATMAT)
@@ -1323,6 +1517,8 @@ class App(ctk.CTk):
             messagebox.showerror("Arquivo obrigatório",
                                  "Selecione um arquivo de códigos."); return
         tipo = self._tipo_extracao()
+        por_classe = self.var_por_classe1.get()
+        mapa = {}
         try:
             df_c = pd.read_excel(arq) if arq.lower().endswith(".xlsx") \
                    else pd.read_csv(arq, sep=";")
@@ -1333,11 +1529,49 @@ class App(ctk.CTk):
                     f"O arquivo deve ter a coluna '{tipo}' (ou 'codigo')."); return
             codigos = pd.Series(df_c[col]).dropna()\
                         .astype(int).drop_duplicates().tolist()
+
+            # Agrupamento explícito: se o arquivo trouxer a classe de cada código,
+            # ela manda. Sem essa coluna, a classe é lida do próprio registro.
+            if por_classe:
+                col_cl = next((c for c in ("classe", "Classe", "codigoClasse")
+                               if c in df_c.columns), None)
+                if col_cl:
+                    val = df_c[[col, col_cl]].dropna()
+                    for cl, grupo in val.groupby(val[col_cl].astype(str)
+                                                    .str.strip().str.replace(r"\.0$", "", regex=True)):
+                        mapa[cl] = grupo[col].astype(int).drop_duplicates().tolist()
         except Exception as e:
             messagebox.showerror("Erro ao ler arquivo", str(e)); return
         d_i, d_f, err = validar_e_obter_datas(self.var_ini1.get(), self.var_fim1.get())
         if err: messagebox.showerror("Data inválida", err); return
-        self._iniciar_processo(codigos, self.var_fmt.get(), d_i, d_f, tipo=tipo)
+
+        # Modo por classe grava vários arquivos: a pasta precisa ser conhecida
+        # ANTES de começar, para que cada classe seja salva em ato contínuo.
+        pasta = ""
+        if por_classe:
+            pasta = self.var_pasta_classe1.get().strip()
+            if not pasta:
+                messagebox.showinfo("Pasta de destino",
+                    "A opção 'um arquivo por classe' gera vários arquivos.\n\n"
+                    "Escolha a pasta onde eles serão salvos.")
+                pasta = filedialog.askdirectory(
+                    title="Escolha a pasta de destino dos arquivos por classe")
+                if not pasta:
+                    messagebox.showwarning("Extração não iniciada",
+                        "Nenhuma pasta escolhida. Selecione a pasta de destino "
+                        "ou desmarque 'Salvar um arquivo por classe'."); return
+                self.var_pasta_classe1.set(pasta)
+            if not os.path.isdir(pasta):
+                messagebox.showerror("Pasta inválida",
+                    f"A pasta não existe:\n{pasta}"); return
+            origem = (f"coluna '{col_cl}' do arquivo" if mapa
+                      else "campo codigoClasse dos registros")
+            self._log(f"🗂️  Um arquivo por classe — origem da classe: {origem}.", "info")
+            self._log(f"📂 Destino: {pasta}", "info")
+
+        self._iniciar_processo(codigos, self.var_fmt.get(), d_i, d_f,
+                               catmats_por_classe=mapa, tipo=tipo,
+                               por_classe=por_classe, pasta_destino=pasta)
 
     def _cancelar(self):
         if not self.processing: return
@@ -1679,10 +1913,13 @@ class App(ctk.CTk):
         if err: messagebox.showerror("Data inválida", err); return
 
         fmt = self.var_fmt.get()
+        self._salvar_corr = self.var_salvar_corr.get()   # capturado na thread principal
+        self._pasta_corr  = self.var_pasta.get()
         self._pasta_classes_destino = pasta_dest
         self.processing   = True
         self.total_baixados = 0
         self.count_corrigidas = 0
+        self.count_reparadas  = 0
         self.count_vazios = 0
         pausar_extracao.set()
         pausar_busca_catmat.set()  # necessário para o fluxo automatizado
@@ -1691,7 +1928,7 @@ class App(ctk.CTk):
 
         self.log.configure(state="normal"); self.log.delete("1.0","end")
         self.log.configure(state="disabled")
-        for k, v in [("k_proc","0"),("k_reg","0"),("k_corr","0"),("k_vaz","0")]:
+        for k, v in [("k_proc","0"),("k_reg","0"),("k_corr","0 · 0"),("k_vaz","0")]:
             self._stat(k, v)
         self.progress.set(0); self.lbl_pct.configure(text="0%")
         self.set_status("Status: Iniciando…")
@@ -1734,8 +1971,8 @@ class App(ctk.CTk):
         """
         ext          = "csv" if fmt == "csv" else "xlsx"
         total_classes_orig = len(classes_lista)
-        salvar_corr  = self.var_salvar_corr.get()
-        pasta_corr   = self.var_pasta.get()
+        salvar_corr  = getattr(self, "_salvar_corr", False)
+        pasta_corr   = getattr(self, "_pasta_corr", "")
         total_catmats_acum = 0
         classes_com_falha  = []   # classes que não retornaram PDMs
 
@@ -1792,14 +2029,19 @@ class App(ctk.CTk):
                         self.count_corrigidas += n_corr
                         reg = self.total_baixados
                     self._ui(lambda r=reg: self._stat("k_reg", f"{r:,}".replace(",",".")))
-                    for _, is_c, pag in dfs_e_meta:
-                        if is_c:
-                            self._ui(lambda cod=codigo, p=pag:
-                                self._log(f"⚠️  Cód {cod} Pág {p}: corrigida.", "warn"))
-                    if pag_corr:
+                    n_rep = sum(1 for _, mk, _ in dfs_e_meta if mk == "reparada")
+                    if n_rep:
                         with state_lock:
-                            cv = self.count_corrigidas
-                        self._ui(lambda vv=cv: self._stat("k_corr", vv))
+                            self.count_reparadas += n_rep
+                    for _, marca, pag in dfs_e_meta:
+                        if marca == "perda":
+                            self._ui(lambda cod=codigo, p=pag:
+                                self._log(f"❌  Cód {cod} Pág {p}: registros perdidos.", "err"))
+                        elif marca == "reparada":
+                            self._ui(lambda cod=codigo, p=pag:
+                                self._log(f"⚠️  Cód {cod} Pág {p}: reparada (íntegra).", "warn"))
+                    if pag_corr or n_rep:
+                        self._ui(self._atualizar_stat_paginas)
                 with state_lock:
                     comp_count[0] += 1
                     total_catmats_acum += 1
@@ -2020,7 +2262,7 @@ class App(ctk.CTk):
 
         # ── MOTOR DE EXTRAÇÃO ─────────────────────────────────────────────────────
     def _iniciar_processo(self, codigos, fmt, d_ini, d_fim, catmats_por_classe=None,
-                          tipo=TIPO_CATMAT):
+                          tipo=TIPO_CATMAT, por_classe=None, pasta_destino=None):
         if not codigos: return
         self.processing            = True
         self.codigos_lista         = codigos
@@ -2028,20 +2270,33 @@ class App(ctk.CTk):
         self._data_fim             = d_fim
         self._fmt                  = fmt
         self._tipo_busca           = tipo
+        # Tk não é thread-safe: capturar aqui, na thread principal
+        self._salvar_corr          = self.var_salvar_corr.get()
+        self._pasta_corr           = self.var_pasta.get()
         self._catmats_por_classe_ativo = catmats_por_classe or {}
-        # Pasta escolhida pelo usuário para salvar os arquivos por classe
-        self._pasta_classes_destino = self.var_pasta_classes.get().strip()             if hasattr(self, "var_pasta_classes") else ""
+        # Um arquivo por classe. Quando não há mapa prévio de códigos→classe,
+        # a classe é lida do campo codigoClasse de cada registro.
+        self._modo_por_classe = (bool(self._catmats_por_classe_ativo)
+                                 if por_classe is None else bool(por_classe))
+        # Pasta escolhida pelo usuário para salvar os arquivos por classe.
+        # pasta_destino explícito evita que a pasta da aba 2 vaze para a aba 1.
+        if pasta_destino is not None:
+            self._pasta_classes_destino = pasta_destino
+        else:
+            self._pasta_classes_destino = (self.var_pasta_classes.get().strip()
+                                           if hasattr(self, "var_pasta_classes") else "")
         self.paginas_corrompidas   = {}
         self.registros_esperados   = {}
         self.registros_baixados    = {}
         self.total_baixados        = 0
         self.count_corrigidas      = 0
+        self.count_reparadas       = 0
         self.count_vazios          = 0
         pausar_extracao.set()
 
         # Se há arquivo por classe, usamos um writer por classe (criados sob demanda)
         # Senão, writer único
-        if self._catmats_por_classe_ativo:
+        if self._modo_por_classe:
             self.writer = None  # será None; usamos self._writers_por_classe
             self._writers_por_classe = {}  # classe → writer
         else:
@@ -2063,7 +2318,7 @@ class App(ctk.CTk):
         self._log(f"🔎 {len(codigos)} códigos carregados.\n", "info")
 
         for k, v in [("k_proc",f"0 / {len(codigos)}"),
-                     ("k_reg","0"),("k_corr","0"),("k_vaz","0")]:
+                     ("k_reg","0"),("k_corr","0 · 0"),("k_vaz","0")]:
             self._stat(k, v)
         self.progress.set(0); self.lbl_pct.configure(text="0%")
         self.set_status("Status: Processando…")
@@ -2082,13 +2337,18 @@ class App(ctk.CTk):
     # Comunicação com UI exclusivamente via self.after(0, callback)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _get_writer_para(self, codigo: int):
-        if not self._catmats_por_classe_ativo:
+    def _get_writer_para(self, codigo: int, classe: str = None):
+        if not self._modo_por_classe:
             return self.writer
-        classe_do_cod = "outras"
-        for classe, cats in self._catmats_por_classe_ativo.items():
+        # Mapa explícito (explorador ou coluna "classe" do arquivo) tem prioridade;
+        # sem ele, vale a classe lida do próprio registro.
+        classe_do_cod = None
+        for cl, cats in self._catmats_por_classe_ativo.items():
             if codigo in cats:
-                classe_do_cod = classe; break
+                classe_do_cod = cl; break
+        if classe_do_cod is None:
+            classe_do_cod = classe or "sem_classe"
+        classe_do_cod = re.sub(r'[\\/:*?"<>|]', "_", str(classe_do_cod)).strip() or "sem_classe"
         if classe_do_cod not in self._writers_por_classe:
             ext   = "csv" if self._fmt == "csv" else "xlsx"
             # Salva direto na pasta escolhida pelo usuário (se informada)
@@ -2108,8 +2368,8 @@ class App(ctk.CTk):
         """Thread de extração paralela — 4 CATMATs simultâneos."""
         codigos     = self.codigos_lista
         total       = len(codigos)
-        salvar_corr = self.var_salvar_corr.get()
-        pasta_corr  = self.var_pasta.get()
+        salvar_corr = getattr(self, "_salvar_corr", False)
+        pasta_corr  = getattr(self, "_pasta_corr", "")
         d_ini       = self._data_inicio
         d_fim       = self._data_fim
         tipo_busca  = getattr(self, "_tipo_busca", TIPO_CATMAT)
@@ -2117,12 +2377,39 @@ class App(ctk.CTk):
         state_lock  = threading.Lock()
         comp_count  = [0]
 
-        def _wlock(codigo):
-            w = self._get_writer_para(codigo)
+        def _wlock(codigo, classe=None):
+            w = self._get_writer_para(codigo, classe)
             k = id(w)
             if k not in writer_locks:
                 writer_locks[k] = threading.Lock()
             return w, writer_locks[k]
+
+        def _escrever(codigo, df_proc):
+            """Roteia o DataFrame para o writer certo, quebrando por classe."""
+            if (not self._modo_por_classe or self._catmats_por_classe_ativo
+                    or "codigoClasse" not in df_proc.columns):
+                w, lk = _wlock(codigo)
+                with lk: w.write_dataframe(df_proc)
+                return
+            # Classe lida do próprio registro: uma partição por classe encontrada
+            chaves = (df_proc["codigoClasse"].astype(str).str.strip()
+                      .replace({"": "sem_classe", "nan": "sem_classe",
+                                "None": "sem_classe"}))
+            for classe, parte in df_proc.groupby(chaves, sort=False):
+                w, lk = _wlock(codigo, str(classe))
+                with lk: w.write_dataframe(parte)
+
+        def _flush_periodico():
+            """Descarrega em disco o que já foi montado (throttled no writer)."""
+            alvos = (list(self._writers_por_classe.values())
+                     if self._modo_por_classe else
+                     ([self.writer] if self.writer else []))
+            for w in alvos:
+                lk = writer_locks.get(id(w))
+                if lk is None:
+                    continue
+                with lk:
+                    w.flush()
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             futures = {
@@ -2159,10 +2446,9 @@ class App(ctk.CTk):
 
                 else:  # "ok"
                     baixados = sum(len(df) for df, _, _ in dfs_e_meta)
-                    w, wlock = _wlock(codigo)
-                    with wlock:
-                        for df_proc, _, _ in dfs_e_meta:
-                            w.write_dataframe(df_proc)
+                    for df_proc, _, _ in dfs_e_meta:
+                        _escrever(codigo, df_proc)
+                    _flush_periodico()
                     with state_lock:
                         self.total_baixados             += baixados
                         self.registros_baixados[codigo]  = baixados
@@ -2172,17 +2458,23 @@ class App(ctk.CTk):
                             self.paginas_corrompidas.setdefault(k, []).extend(v)
                         n_c = sum(len(v) for v in pag_corr.values())
                         self.count_corrigidas += n_c
-                        cv = self.count_corrigidas
                     self._ui(lambda r=reg: self._stat("k_reg", f"{r:,}".replace(",",".")))
-                    for _, is_c, pag in dfs_e_meta:
-                        if is_c:
+                    n_rep = sum(1 for _, mk, _ in dfs_e_meta if mk == "reparada")
+                    if n_rep:
+                        with state_lock:
+                            self.count_reparadas += n_rep
+                    for _, marca, pag in dfs_e_meta:
+                        if marca == "perda":
                             self._ui(lambda cod=codigo, p=pag:
-                                self._log(f"⚠️  Cód {cod} Pág {p}: corrigida.", "warn"))
+                                self._log(f"❌  Cód {cod} Pág {p}: registros perdidos.", "err"))
+                        elif marca == "reparada":
+                            self._ui(lambda cod=codigo, p=pag:
+                                self._log(f"⚠️  Cód {cod} Pág {p}: reparada (íntegra).", "warn"))
                         else:
                             self._ui(lambda cod=codigo, p=pag:
                                 self._log(f"✅  Cód {cod} Pág {p}: OK.", "ok"))
-                    if pag_corr:
-                        self._ui(lambda vv=cv: self._stat("k_corr", vv))
+                    if pag_corr or n_rep:
+                        self._ui(self._atualizar_stat_paginas)
 
                 pct = comp / total
                 self._ui(lambda p=pct, c=comp, t=total: (
@@ -2205,7 +2497,7 @@ class App(ctk.CTk):
 
         # Finalizar writers
         parts = []
-        if self._catmats_por_classe_ativo and self._writers_por_classe:
+        if self._modo_por_classe and self._writers_por_classe:
             for classe, w in self._writers_por_classe.items():
                 p = w.finalize(); parts.extend(p)
                 if p: self._log(f"📂 Classe {classe}: {', '.join(p)}", "info")
@@ -2229,8 +2521,11 @@ class App(ctk.CTk):
                       f"OK (divergencia: {bx}/{ex})" if d<=2 else
                       f"Inconsistencia Grave ({bx}/{ex})")
                 ws.append([c,ex,bx,", ".join(map(str,pg)),st])
-            wb.save("Relatorio_Integridade.xlsx")
-            self._log("📊 Relatorio_Integridade.xlsx gerado.", "info")
+            pasta_rel = getattr(self, "_pasta_classes_destino", "").strip()
+            cam_rel = (os.path.join(pasta_rel, "Relatorio_Integridade.xlsx")
+                       if pasta_rel else "Relatorio_Integridade.xlsx")
+            wb.save(cam_rel)
+            self._log(f"📊 {cam_rel} gerado.", "info")
         except Exception as e:
             self._log(f"⚠️ Relatório não salvo: {e}", "warn")
 
@@ -2245,7 +2540,7 @@ class App(ctk.CTk):
             messagebox.showinfo("Sem dados","Nenhum dado válido baixado.")
             return
 
-        n_classes = len(self._writers_por_classe) if self._catmats_por_classe_ativo else 0
+        n_classes = len(self._writers_por_classe) if self._modo_por_classe else 0
         ext = os.path.splitext(parts[0])[1]
 
         resumo_linhas = [
@@ -2253,24 +2548,23 @@ class App(ctk.CTk):
             chr(8212)*40,
             f"Codigos Processados:     {len(self.codigos_lista)}",
             f"Registros Consolidados:  {self.total_baixados:,}",
-            f"Paginas Corrigidas:      {self.count_corrigidas}",
+            f"Paginas Reparadas:       {self.count_reparadas}",
+            f"Paginas com Perda:       {self.count_corrigidas}",
             f"Codigos sem Registros:   {self.count_vazios}",
         ]
-        if n_classes > 1:
+        if n_classes >= 1:
             resumo_linhas.append(f"Arquivos por classe:     {n_classes}")
         messagebox.showinfo("Resumo", "\n".join(resumo_linhas))
 
-        if n_classes > 1:
+        # Modo por classe: mesmo com uma única classe os arquivos já têm nome
+        # próprio (classe_XXXX) e destino definido — não faz sentido pedir
+        # "salvar como" para eles.
+        if n_classes >= 1:
             pasta_dest = getattr(self, "_pasta_classes_destino", "").strip()
             nomes = "\n".join(os.path.basename(p) for p in parts)
             if pasta_dest:
-                # Arquivos já foram escritos direto na pasta pelo writer
-                # Apenas copiar o relatório de integridade para a mesma pasta
-                try:
-                    shutil.copy("Relatorio_Integridade.xlsx",
-                                os.path.join(pasta_dest, "Relatorio_Integridade.xlsx"))
-                except Exception:
-                    pass
+                # Os writers já gravaram direto na pasta ao longo da execução;
+                # o relatório de integridade também. Nada a copiar nem a perguntar.
                 self._log(f"📁 {len(parts)} arquivo(s) em: {pasta_dest}", "info")
                 messagebox.showinfo("Concluído",
                     f"{len(parts)} arquivo(s) salvos em:\n{pasta_dest}\n\n{nomes}")
