@@ -241,26 +241,6 @@ Para saída em CSV nada disso é necessário: a escrita sempre foi em append (~1
 
 ---
 
-## Testes
-
-Bateria offline, sem tocar a API — todas as requisições são mockadas:
-
-| arquivo | cobertura |
-|---|---|
-| `teste_parser.py` | 11 páginas sintéticas com quebras cruas, aspas, `;` internos e separadores Unicode |
-| `teste_tipo.py` | assinatura nova, fallback legado, recusa de PDM em API antiga, marcação de colunas |
-| `teste_paginacao.py` | 7 cenários de rodapé, incluindo separador de milhar e metadados divergentes |
-| `teste_writers.py` | alinhamento de colunas no CSV e sanitização no XLSX |
-| `teste_streaming.py` | conteúdo, espelho, rollover em múltiplas partes, `finalize()` idempotente |
-| `teste_flush.py` | espelho `.parcial.csv` durante a execução e após queda simulada |
-| `teste_contadores.py` | reparo e perda contados separadamente, end-to-end na aplicação real |
-| `teste_por_classe.py` | classe vinda dos registros, agrupamento explícito e regressão sem agrupamento |
-| `teste_pasta_classe.py` | pasta definida no início, ausência de diálogos, sem resíduo no diretório de trabalho |
-| `teste_popup_pasta.py` | pop-up de pasta, cancelamento e pasta inexistente |
-| `bench_final.py` | comparação in-memory × streaming com tempo e memória |
-
----
-
 ## Pontos em aberto
 
 - **Memória na busca por PDM.** O worker acumula todas as páginas antes de escrever. Com `tipo=codigoPdm`, um único código pode trazer dezenas de milhares de registros — gravar por página evitaria o pico.
