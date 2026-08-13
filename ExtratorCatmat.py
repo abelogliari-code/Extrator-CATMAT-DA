@@ -23,6 +23,16 @@ from tkinter import filedialog, messagebox, scrolledtext
 import customtkinter as ctk
 import tkinter.ttk as ttk
 
+# Motor da aba 3 (consolidação DW + DA / remoção de duplicatas). Import
+# protegido: se o arquivo não estiver ao lado do programa, as duas primeiras
+# abas continuam funcionando normalmente e a terceira explica o que falta.
+try:
+    import consolidar_dw_da as consolidador
+    _ERRO_CONSOLIDADOR = ""
+except Exception as _e:                      # ImportError, openpyxl ausente, etc.
+    consolidador = None
+    _ERRO_CONSOLIDADOR = f"{type(_e).__name__}: {_e}"
+
 # =============================================================================
 # PALETA  —  neutros Gov.br + acento azul Gov + verde BPS + amarelo BPS
 # =============================================================================
@@ -929,7 +939,7 @@ Sua ferramenta para extrair e descobrir dados no Portal de Compras Governamentai
 O que este programa faz?
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Este programa possui duas funcoes principais em abas separadas:
+Este programa possui tres funcoes principais em abas separadas:
 
   1. Extracao por CATMAT (esta aba)
      Se voce ja tem uma lista de codigos de materiais (CATMATs), esta aba
@@ -941,6 +951,11 @@ Este programa possui duas funcoes principais em abas separadas:
      ou mais Classes, encontrar todos os Padroes Descritivos de Materiais
      (PDMs) dentro delas e, em seguida, listar todos os CATMATs relacionados
      para extracao.
+
+  3. Consolidacao DW + DA (ultima aba)
+     Junta o historico do DW (SIASG) com o do DA (Dados Abertos) em uma
+     planilha por Classe, removendo do DA todo registro que ja exista no
+     DW. A chave e o identificador de 22 digitos do item da compra.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Primeiros Passos
@@ -964,6 +979,43 @@ Primeiros Passos
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Acompanhe todo o processo em tempo real neste log. Bom trabalho!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+
+BEMVINDO_CONSOLIDACAO = """\
+Consolidacao DW + DA  —  remocao de duplicatas
+
+Junta os dados do DW (SIASG) e do DA (Dados Abertos / Compras.gov) em uma
+planilha por Classe, com duas abas (dw-XXXX e da-XXXX), descartando do DA
+todo registro que ja exista no DW.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Regra de duplicidade
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A chave e a identificacao do item da compra, com 22 digitos:
+
+  DW  -> coluna "Identif Item Compra" (ja vem com 22 digitos)
+  DA  -> idCompra (completado com zeros a esquerda ate 17)
+         + numeroItemCompra (completado ate 5)
+
+Se a chave do DA existir no DW, a linha do DA sai: o DW e a fonte
+preferencial, por trazer mais informacao.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Como usar
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. Adicione as pastas (ou arquivos) com os CSVs/XLSX do DW e do DA.
+     Com "Detectar", a origem de cada arquivo e descoberta pelo cabecalho;
+     use DW ou DA para forcar a classificacao.
+  2. Escolha a pasta de saida.
+  3. Clique em "Consolidar e Remover Duplicatas".
+
+Alem das planilhas por classe, sao gerados o Relatorio_Consolidacao.xlsx
+(contagens por classe) e, quando houver, o linhas_em_quarentena.csv com as
+linhas corrompidas na origem — preservadas na integra e fora das planilhas.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -1094,8 +1146,10 @@ class App(ctk.CTk):
         self.tabs.pack(fill="both", expand=True)
         self.tabs.add("  Extração por CATMAT  ")
         self.tabs.add("  Extração por Classes  ")
+        self.tabs.add("  Consolidação DW + DA  ")
         self._build_tab_extracao(self.tabs.tab("  Extração por CATMAT  "))
         self._build_tab_explorador(self.tabs.tab("  Extração por Classes  "))
+        self._build_tab_consolidacao(self.tabs.tab("  Consolidação DW + DA  "))
 
     # ── ABA 1 ─────────────────────────────────────────────────────────────────
     def _build_tab_extracao(self, parent):
@@ -1450,6 +1504,185 @@ class App(ctk.CTk):
             self._iniciar_exp, variant="success")
         self.btn_ini_exp.configure(state="disabled")
         self.btn_ini_exp.pack(side="left")
+
+    # ── ABA 3 ─────────────────────────────────────────────────────────────────
+    def _build_tab_consolidacao(self, parent):
+        """Consolida DW (SIASG) + DA (Compras.gov) removendo do DA o que já está
+        no DW. Motor: consolidar_dw_da.consolidar()."""
+        parent.configure(fg_color=C_BG)
+
+        # estado próprio da aba — nada é compartilhado com as abas 1 e 2
+        self._cons_entradas   = []      # [{"caminho": str, "origem": "auto|dw|da"}]
+        self._cons_rodando    = False
+        self._cons_cancelar   = False
+        self._cons_ultima_saida = ""
+
+        # ── Card 1: entradas ─────────────────────────────────────────────────
+        c1 = _card(parent, "1.  Arquivos de Entrada  (CSV/XLSX do DW e do DA)")
+        c1.pack(fill="x", padx=12, pady=(8,6))
+        inn1 = ctk.CTkFrame(c1, fg_color="transparent")
+        inn1.pack(fill="x", padx=14, pady=(0,10))
+
+        rb = ctk.CTkFrame(inn1, fg_color="transparent"); rb.pack(fill="x", pady=(0,6))
+        _lbl(rb, "Origem:", color=C_TEXT_MED).pack(side="left", padx=(0,8))
+        self.var_cons_origem = tk.StringVar(value="Detectar")
+        ctk.CTkSegmentedButton(
+            rb, values=["Detectar", "DW", "DA"], variable=self.var_cons_origem,
+            font=("Segoe UI", 12), width=200, corner_radius=6,
+            fg_color=C_BG, selected_color=C_ACCENT, selected_hover_color=C_ACCENT_H,
+            unselected_color=C_BG, unselected_hover_color=C_BORDER,
+            text_color=C_TEXT).pack(side="left")
+        _btn(rb, "📁  Pasta…", self._cons_add_pasta, variant="primary", width=100)\
+            .pack(side="left", padx=(12,6))
+        _btn(rb, "📄  Arquivos…", self._cons_add_arquivos, variant="secondary",
+             width=110).pack(side="left", padx=(0,6))
+        _btn(rb, "Remover", self._cons_remover, variant="ghost", width=90)\
+            .pack(side="left", padx=(0,6))
+        _btn(rb, "Limpar", self._cons_limpar, variant="ghost", width=80)\
+            .pack(side="left")
+        _lbl(rb, "  \"Detectar\" descobre DW/DA pelo cabeçalho do arquivo",
+             size=10, color=C_TEXT_LIGHT).pack(side="left", padx=(10,0))
+
+        tf = ctk.CTkFrame(inn1, fg_color=C_SURFACE, corner_radius=0)
+        tf.pack(fill="x")
+        vsb_c = ttk.Scrollbar(tf, orient="vertical")
+        vsb_c.pack(side="right", fill="y")
+        self.tree_cons = ttk.Treeview(tf, columns=("origem","caminho"),
+                                      show="headings", style="BPS.Treeview",
+                                      selectmode="extended", height=5,
+                                      yscrollcommand=vsb_c.set)
+        vsb_c.configure(command=self.tree_cons.yview)
+        self.tree_cons.heading("origem",  text="Origem")
+        self.tree_cons.heading("caminho", text="Pasta / Arquivo")
+        self.tree_cons.column("origem",  width=90, anchor="center", stretch=False)
+        self.tree_cons.column("caminho", width=9999, anchor="w", stretch=True)
+        self.tree_cons.pack(fill="x")
+
+        # ── Card 2: saída e opções ───────────────────────────────────────────
+        c2 = _card(parent, "2.  Saída e Opções")
+        c2.pack(fill="x", padx=12, pady=(0,6))
+        inn2 = ctk.CTkFrame(c2, fg_color="transparent")
+        inn2.pack(fill="x", padx=14, pady=(0,10))
+
+        rs = ctk.CTkFrame(inn2, fg_color="transparent"); rs.pack(fill="x", pady=3)
+        _lbl(rs, "Pasta de saída:", color=C_TEXT_MED).pack(side="left", padx=(0,8))
+        self.var_cons_saida = tk.StringVar()
+        _entry(rs, textvariable=self.var_cons_saida,
+               placeholder="Onde as planilhas por classe serão gravadas",
+               width=420).pack(side="left", expand=True, fill="x")
+        _btn(rs, "📂  Procurar", self._cons_escolher_saida, variant="ghost",
+             width=100).pack(side="left", padx=(8,0))
+
+        ro = ctk.CTkFrame(inn2, fg_color="transparent"); ro.pack(fill="x", pady=3)
+        _lbl(ro, "Prefixo:", color=C_TEXT_MED).pack(side="left", padx=(0,6))
+        self.var_cons_prefixo = tk.StringVar(value="bps_dw_da__Classe_")
+        _entry(ro, textvariable=self.var_cons_prefixo, width=180).pack(side="left")
+        _lbl(ro, "Sufixo:", color=C_TEXT_MED).pack(side="left", padx=(14,6))
+        self.var_cons_sufixo = tk.StringVar()
+        _entry(ro, textvariable=self.var_cons_sufixo,
+               placeholder="ex.: _2021_a_2026", width=140).pack(side="left")
+        _lbl(ro, "Ano mín.:", color=C_TEXT_MED).pack(side="left", padx=(14,6))
+        self.var_cons_ano_min = tk.StringVar()
+        _entry(ro, textvariable=self.var_cons_ano_min, placeholder="AAAA",
+               width=70).pack(side="left")
+        _lbl(ro, "Ano máx.:", color=C_TEXT_MED).pack(side="left", padx=(10,6))
+        self.var_cons_ano_max = tk.StringVar()
+        _entry(ro, textvariable=self.var_cons_ano_max, placeholder="AAAA",
+               width=70).pack(side="left")
+
+        rc = ctk.CTkFrame(inn2, fg_color="transparent"); rc.pack(fill="x", pady=3)
+        self.var_cons_dup = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(rc, text="Gerar CSV de auditoria com as duplicatas removidas",
+                        variable=self.var_cons_dup, font=("Segoe UI",12),
+                        text_color=C_TEXT, fg_color=C_ACCENT,
+                        border_color=C_BORDER).pack(side="left", padx=(0,20))
+        self.var_cons_dedup_interno = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(rc, text="Também remover repetições internas do DA",
+                        variable=self.var_cons_dedup_interno, font=("Segoe UI",12),
+                        text_color=C_TEXT, fg_color=C_ACCENT,
+                        border_color=C_BORDER).pack(side="left")
+        _lbl(rc, "  (atenção: costumam ser registros distintos, com fornecedor "
+                 "e preço diferentes)", size=10, color=C_TEXT_LIGHT).pack(side="left")
+
+        # ── Resumo ───────────────────────────────────────────────────────────
+        grid = ctk.CTkFrame(parent, fg_color=C_BG)
+        grid.pack(fill="x", padx=12, pady=(0,6))
+        stats = [
+            ("Linhas do DW",        "c_dw",   C_ACCENT),
+            ("Linhas do DA lidas",  "c_lidas", C_TEXT_MED),
+            ("Duplicatas Removidas","c_dup",  C_ORANGE),
+            ("Linhas do DA Mantidas","c_mant", C_GREEN),
+        ]
+        self._stats_cons = {}
+        for col, (nome, key, cor) in enumerate(stats):
+            cell = ctk.CTkFrame(grid, fg_color=C_SURFACE, corner_radius=6,
+                                border_width=1, border_color=C_BORDER)
+            cell.grid(row=0, column=col, padx=5, pady=0, sticky="ew")
+            grid.grid_columnconfigure(col, weight=1)
+            _lbl(cell, nome, size=10, color=C_TEXT_MED).pack(pady=(6,1))
+            lv = ctk.CTkLabel(cell, text="0", font=("Segoe UI",17,"bold"),
+                              text_color=cor)
+            lv.pack(pady=(0,6))
+            self._stats_cons[key] = lv
+
+        # ── Card 3: log e progresso ──────────────────────────────────────────
+        c3 = _card(parent, "3.  Log e Progresso")
+        c3.pack(fill="both", expand=True, padx=12, pady=(0,4))
+
+        brow = ctk.CTkFrame(c3, fg_color="transparent")
+        brow.pack(fill="x", padx=14, pady=(0,4))
+        self.lbl_cons_status = _lbl(brow, "Status: Ocioso", size=11,
+                                    color=C_TEXT_MED, anchor="w")
+        self.lbl_cons_status.pack(side="left", expand=True, fill="x")
+        self.lbl_cons_pct = _lbl(brow, "0%", size=11, weight="bold", color=C_GREEN)
+        self.lbl_cons_pct.pack(side="right", padx=(8,0))
+
+        self.progress_cons = ctk.CTkProgressBar(c3, fg_color=C_BORDER,
+                                                progress_color=C_GREEN,
+                                                corner_radius=3, height=6)
+        self.progress_cons.set(0)
+        self.progress_cons.pack(fill="x", padx=14, pady=(0,8))
+
+        log_wrap = ctk.CTkFrame(c3, fg_color=C_LOG_BG, corner_radius=6)
+        log_wrap.pack(fill="both", expand=True, padx=14, pady=(0,10))
+        self.log_cons = scrolledtext.ScrolledText(
+            log_wrap, bg=C_LOG_BG, fg=C_LOG_FG, font=("Consolas",10),
+            wrap="word", relief="flat", bd=0, state="normal", height=7,
+            insertbackground=C_LOG_FG)
+        self.log_cons.pack(fill="both", expand=True, padx=6, pady=6)
+        for tag, cor in [("ok","#4EC94E"),("warn","#F4A11D"),
+                         ("err","#E05C5C"),("info","#7EB8F7")]:
+            self.log_cons.tag_config(tag, foreground=cor)
+
+        # ── Botões ───────────────────────────────────────────────────────────
+        br = ctk.CTkFrame(parent, fg_color="transparent")
+        br.pack(fill="x", padx=12, pady=(0,8))
+        self.btn_cons_start = _btn(br, "▶  Consolidar e Remover Duplicatas",
+                                   self._cons_iniciar, variant="primary", width=250)
+        self.btn_cons_start.pack(side="left", padx=(0,8))
+        self.btn_cons_cancel = _btn(br, "✖  Cancelar", self._cons_cancelar_click,
+                                    variant="secondary", width=100)
+        self.btn_cons_cancel.configure(state="disabled")
+        self.btn_cons_cancel.pack(side="left", padx=(0,8))
+        self.btn_cons_abrir = _btn(br, "📂  Abrir Pasta de Saída",
+                                   self._cons_abrir_pasta, variant="ghost", width=170)
+        self.btn_cons_abrir.configure(state="disabled")
+        self.btn_cons_abrir.pack(side="left", padx=(0,8))
+        self.btn_cons_log = _btn(br, "💾  Salvar Log", self._cons_salvar_log,
+                                 variant="secondary", width=120)
+        self.btn_cons_log.configure(state="disabled")
+        self.btn_cons_log.pack(side="left")
+
+        if consolidador is None:
+            self.btn_cons_start.configure(state="disabled")
+            self._log_cons(
+                "⚠ Módulo de consolidação indisponível.\n"
+                f"   Detalhe: {_ERRO_CONSOLIDADOR}\n\n"
+                "   Coloque o arquivo consolidar_dw_da.py na mesma pasta do\n"
+                "   programa (e garanta o openpyxl instalado) para habilitar\n"
+                "   esta aba.", "err")
+        else:
+            self._log_cons(BEMVINDO_CONSOLIDACAO, "info")
 
         # ── LOG HELPERS ───────────────────────────────────────────────────────────
     def _log(self, msg: str, tag: str = ""):
@@ -2600,6 +2833,292 @@ class App(ctk.CTk):
                     f"Dados salvos em:\n{dest}\n\nRelatorio de integridade na pasta do programa.")
             else:
                 messagebox.showwarning("Atencao", f"Arquivo permanece em:\n{ultimo}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ABA 3 — CONSOLIDAÇÃO DW + DA (remoção de duplicatas)
+    # A regra de negócio vive em consolidar_dw_da.py; aqui só há interface.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _log_cons(self, msg: str, tag: str = ""):
+        self.log_cons.configure(state="normal")
+        self.log_cons.insert("end", msg + "\n", tag)
+        self.log_cons.see("end")
+        self.log_cons.configure(state="disabled")
+
+    def _stat_cons(self, key, val):
+        self._stats_cons[key].configure(text=str(val))
+
+    @staticmethod
+    def _fmt_br(n) -> str:
+        """1234567 -> 1.234.567"""
+        return f"{n:,}".replace(",", ".")
+
+    # ── entradas ─────────────────────────────────────────────────────────────
+    _ROTULO_ORIGEM = {"Detectar": "auto", "DW": "dw", "DA": "da"}
+
+    def _cons_add(self, caminhos):
+        origem = self._ROTULO_ORIGEM.get(self.var_cons_origem.get(), "auto")
+        ja = {e["caminho"] for e in self._cons_entradas}
+        novos = 0
+        for c in caminhos:
+            if c and c not in ja:
+                self._cons_entradas.append({"caminho": c, "origem": origem})
+                ja.add(c); novos += 1
+        if novos:
+            self._cons_atualizar_tree()
+
+    def _cons_add_pasta(self):
+        p = filedialog.askdirectory(
+            title="Pasta com os CSVs/XLSX do DW e/ou do DA")
+        if p:
+            self._cons_add([p])
+
+    def _cons_add_arquivos(self):
+        arqs = filedialog.askopenfilenames(
+            title="Arquivos do DW e/ou do DA",
+            filetypes=[("CSV/Excel","*.csv *.xlsx *.xlsm"),("Todos","*.*")])
+        if arqs:
+            self._cons_add(list(arqs))
+
+    def _cons_atualizar_tree(self):
+        self.tree_cons.delete(*self.tree_cons.get_children())
+        rotulo = {v: k for k, v in self._ROTULO_ORIGEM.items()}
+        for i, e in enumerate(self._cons_entradas):
+            self.tree_cons.insert("", "end", iid=str(i),
+                                  values=(rotulo.get(e["origem"], "Detectar"),
+                                          e["caminho"]))
+
+    def _cons_remover(self):
+        sel = self.tree_cons.selection()
+        if not sel:
+            messagebox.showinfo("Nada selecionado",
+                                "Selecione na lista o que deseja remover.")
+            return
+        for i in sorted((int(s) for s in sel), reverse=True):
+            del self._cons_entradas[i]
+        self._cons_atualizar_tree()
+
+    def _cons_limpar(self):
+        self._cons_entradas = []
+        self._cons_atualizar_tree()
+
+    def _cons_escolher_saida(self):
+        p = filedialog.askdirectory(title="Pasta de saída da consolidação")
+        if p:
+            self.var_cons_saida.set(p)
+
+    def _cons_abrir_pasta(self):
+        pasta = self._cons_ultima_saida or self.var_cons_saida.get().strip()
+        if not pasta:
+            return
+        try:
+            os.startfile(pasta)                     # Windows
+        except Exception:
+            messagebox.showinfo("Pasta de saída", pasta)
+
+    def _cons_salvar_log(self):
+        p = filedialog.asksaveasfilename(defaultextension=".txt",
+                                         filetypes=[("Texto","*.txt")])
+        if p:
+            try:
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(self.log_cons.get("1.0", "end"))
+                messagebox.showinfo("Salvo", f"Log salvo em:\n{p}")
+            except Exception as e:
+                messagebox.showerror("Erro", str(e))
+
+    # ── execução ─────────────────────────────────────────────────────────────
+    def _cons_iniciar(self):
+        if consolidador is None or self._cons_rodando:
+            return
+        if not self._cons_entradas:
+            messagebox.showerror("Sem entradas",
+                "Adicione ao menos uma pasta ou arquivo do DW/DA."); return
+
+        saida = self.var_cons_saida.get().strip()
+        if not saida:
+            messagebox.showerror("Pasta de saída",
+                "Escolha a pasta onde as planilhas serão gravadas."); return
+
+        def _ano(var, nome):
+            v = var.get().strip()
+            if not v:
+                return None, True
+            if not (v.isdigit() and len(v) == 4):
+                messagebox.showerror("Ano inválido",
+                    f"{nome} deve ter 4 dígitos (ex.: 2021)."); return None, False
+            return int(v), True
+
+        ano_min, ok = _ano(self.var_cons_ano_min, "Ano mínimo")
+        if not ok: return
+        ano_max, ok = _ano(self.var_cons_ano_max, "Ano máximo")
+        if not ok: return
+        if ano_min and ano_max and ano_min > ano_max:
+            messagebox.showerror("Filtro de ano",
+                "O ano mínimo não pode ser maior que o ano máximo."); return
+
+        # A saída dentro da entrada faz as planilhas geradas voltarem como
+        # entrada numa segunda execução — serão ignoradas, mas custam leitura.
+        saida_abs = os.path.abspath(saida)
+        for e in self._cons_entradas:
+            ent_abs = os.path.abspath(e["caminho"])
+            if os.path.isdir(ent_abs) and \
+               (saida_abs == ent_abs or saida_abs.startswith(ent_abs + os.sep)):
+                if not messagebox.askyesno("Saída dentro da entrada",
+                    "A pasta de saída está dentro de uma pasta de entrada.\n\n"
+                    "Os arquivos gerados serão relidos (e ignorados) em uma "
+                    "próxima execução.\n\nDeseja continuar mesmo assim?"):
+                    return
+                break
+
+        # Tk não é thread-safe: tudo é lido aqui, na thread principal.
+        params = dict(
+            entradas=[e["caminho"] for e in self._cons_entradas if e["origem"] == "auto"],
+            dw=[e["caminho"] for e in self._cons_entradas if e["origem"] == "dw"],
+            da=[e["caminho"] for e in self._cons_entradas if e["origem"] == "da"],
+            saida=saida,
+            prefixo=self.var_cons_prefixo.get().strip() or "bps_dw_da__Classe_",
+            sufixo=self.var_cons_sufixo.get().strip(),
+            ano_min=ano_min, ano_max=ano_max,
+            salvar_duplicatas=bool(self.var_cons_dup.get()),
+            dedup_interno_da=bool(self.var_cons_dedup_interno.get()),
+        )
+
+        self._cons_rodando  = True
+        self._cons_cancelar = False
+        self._cons_ultima_saida = saida
+        self.log_cons.configure(state="normal")
+        self.log_cons.delete("1.0", "end")
+        self.log_cons.configure(state="disabled")
+        for k in ("c_dw", "c_lidas", "c_dup", "c_mant"):
+            self._stat_cons(k, "0")
+        self.progress_cons.set(0)
+        self.lbl_cons_pct.configure(text="0%")
+        self.lbl_cons_status.configure(text="Status: Consolidando…")
+        self.btn_cons_start.configure(state="disabled")
+        self.btn_cons_cancel.configure(state="normal", fg_color=C_RED,
+                                       hover_color="#992B1E", text_color=C_SURFACE)
+        self.btn_cons_abrir.configure(state="disabled")
+        self.btn_cons_log.configure(state="disabled")
+
+        self._log_cons(f"📁 Saída: {saida}", "info")
+        if ano_min or ano_max:
+            self._log_cons(f"📅 Filtro de ano: "
+                           f"{ano_min or '—'} a {ano_max or '—'}", "info")
+        if params["dedup_interno_da"]:
+            self._log_cons("⚠ Dedup interno do DA ativo: repetições da mesma "
+                           "chave dentro do próprio DA também serão removidas.",
+                           "warn")
+        self._log_cons("", "")
+
+        threading.Thread(target=self._cons_thread, args=(params,),
+                         daemon=True).start()
+
+    def _cons_cancelar_click(self):
+        if not self._cons_rodando:
+            return
+        self._cons_cancelar = True
+        self.lbl_cons_status.configure(text="Status: Cancelando…")
+        self._log_cons("\n🛑 Cancelamento solicitado — encerrando…", "warn")
+
+    def _cons_thread(self, params):
+        """Roda o motor fora da thread da UI; toda a volta é via self.after(0, …)."""
+        try:
+            res = consolidador.consolidar(
+                log=lambda m: self._ui(lambda: self._log_cons(m)),
+                progresso=lambda f, r="": self._ui(
+                    lambda: self._cons_progresso(f, r)),
+                cancelado=lambda: self._cons_cancelar,
+                **params)
+            self._ui(lambda: self._cons_finalizar(res, None))
+        except Exception as e:
+            self._ui(lambda e=e: self._cons_finalizar(None, e))
+
+    def _cons_progresso(self, fracao, rotulo=""):
+        fracao = max(0.0, min(1.0, float(fracao)))
+        self.progress_cons.set(fracao)
+        self.lbl_cons_pct.configure(text=f"{int(fracao * 100)}%")
+        if rotulo:
+            self.lbl_cons_status.configure(text=f"Status: {rotulo}")
+
+    def _cons_finalizar(self, res, erro):
+        self._cons_rodando = False
+        self.btn_cons_start.configure(state="normal")
+        self.btn_cons_cancel.configure(state="disabled", fg_color="#E4E7EF",
+                                       hover_color=C_BORDER, text_color=C_TEXT)
+        self.btn_cons_log.configure(state="normal")
+
+        if erro is not None:
+            self.lbl_cons_status.configure(text="Status: Erro")
+            self._log_cons(f"\n❌ Falha na consolidação: "
+                           f"{type(erro).__name__}: {erro}", "err")
+            messagebox.showerror("Erro na consolidação", str(erro))
+            return
+
+        if res.get("cancelado"):
+            self.lbl_cons_status.configure(text="Status: Cancelado")
+            self.progress_cons.set(0); self.lbl_cons_pct.configure(text="0%")
+            return
+
+        t = res.get("totais", {})
+        self._stat_cons("c_dw",    self._fmt_br(t.get("dw", 0)))
+        self._stat_cons("c_lidas", self._fmt_br(t.get("da_lidas", 0)))
+        self._stat_cons("c_dup",   self._fmt_br(t.get("da_dup", 0)))
+        self._stat_cons("c_mant",  self._fmt_br(t.get("da_mantidas", 0)))
+
+        gerados = res.get("gerados", {})
+        if not gerados:
+            self.lbl_cons_status.configure(text="Status: Nada a consolidar")
+            n_dw, n_da = res.get("arquivos_dw", 0), res.get("arquivos_da", 0)
+            if not (n_dw or n_da):
+                detalhe = ("Nenhum arquivo das entradas foi reconhecido como DW "
+                           "ou DA.\nConfira os cabeçalhos ou classifique "
+                           "manualmente em \"Origem\".")
+            else:
+                detalhe = (f"{n_dw} arquivo(s) do DW e {n_da} do DA foram lidos, "
+                           "mas nenhuma linha válida sobrou.\nVeja o "
+                           "linhas_em_quarentena.csv e o filtro de ano.")
+            self._log_cons("\n⚠ " + detalhe.replace("\n", "\n   "), "warn")
+            messagebox.showwarning("Nada a consolidar", detalhe)
+            return
+
+        self.progress_cons.set(1.0); self.lbl_cons_pct.configure(text="100%")
+        self.lbl_cons_status.configure(text="Status: Concluído!")
+        self.btn_cons_abrir.configure(state="normal")
+
+        pct = (t.get("da_dup", 0) / t["da_lidas"] * 100) if t.get("da_lidas") else 0
+        self._log_cons("\n" + "═" * 58, "info")
+        self._log_cons(f"✅ {len(gerados)} planilha(s) gerada(s) em: "
+                       f"{res.get('pasta_saida','')}", "ok")
+        self._log_cons(f"   Relatório: {res.get('relatorio','')}", "ok")
+        self._log_cons(f"   DA removido (já estava no DW): "
+                       f"{self._fmt_br(t.get('da_dup', 0))}  ({pct:.2f}% do DA)", "ok")
+        if res.get("arquivo_duplicatas"):
+            self._log_cons(f"   Auditoria das duplicatas: "
+                           f"{res['arquivo_duplicatas']}", "ok")
+        if res.get("ignorados"):
+            self._log_cons(f"⚠ {len(res['ignorados'])} arquivo(s) ignorado(s) "
+                           f"(cabeçalho não reconhecido).", "warn")
+        if res.get("quarentena"):
+            self._log_cons(f"⚠ {self._fmt_br(res['quarentena'])} linha(s) "
+                           f"corrompida(s) fora das planilhas — conteúdo "
+                           f"preservado em {res.get('arquivo_quarentena','')}.",
+                           "warn")
+        if res.get("modalidades_desconhecidas"):
+            self._log_cons("⚠ Códigos de modalidade não mapeados: "
+                           + ", ".join(res["modalidades_desconhecidas"])
+                           + "\n   Complete MAPA_MODALIDADE_DA em "
+                             "consolidar_dw_da.py.", "warn")
+        self._log_cons("═" * 58, "info")
+
+        messagebox.showinfo("Concluído",
+            f"Consolidação finalizada!\n\n"
+            f"Planilhas geradas: {len(gerados)}\n"
+            f"Linhas do DW: {self._fmt_br(t.get('dw', 0))}\n"
+            f"Duplicatas removidas do DA: {self._fmt_br(t.get('da_dup', 0))}\n"
+            f"Linhas do DA mantidas: {self._fmt_br(t.get('da_mantidas', 0))}\n\n"
+            f"Pasta: {res.get('pasta_saida','')}")
+
 
 # =============================================================================
 if __name__ == "__main__":
