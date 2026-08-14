@@ -25,11 +25,13 @@ import unicodedata
 from datetime import date, datetime
 from pathlib import Path
 from openpyxl import Workbook, load_workbook
-from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.worksheet.worksheet import Worksheet
 import shutil
 import json
+import queue
+import xlsxwriter
+import multiprocessing
+from array import array
 import threading
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1018,6 +1020,13 @@ Como usar
   2. Escolha a pasta de saida.
   3. Clique em "Consolidar e Remover Duplicatas".
 
+Cada classe vira uma pasta de trabalho com as abas DW e DA. Se uma delas
+passar do limite de 1.048.576 linhas do Excel, o excedente vai para
+"... - Parte 2", cortando em fronteira de ano.
+
+"Processos" divide a gravacao entre nucleos do computador - uma classe por
+processo. Comece com 1 e va aumentando: o ganho depende da maquina.
+
 Alem das planilhas por classe, sao gerados o Relatorio_Consolidacao.xlsx
 (contagens por classe) e, quando houver, o linhas_em_quarentena.csv com as
 linhas corrompidas na origem — preservadas na integra e fora das planilhas.
@@ -1580,7 +1589,7 @@ class App(ctk.CTk):
 
         ro = ctk.CTkFrame(inn2, fg_color="transparent"); ro.pack(fill="x", pady=3)
         _lbl(ro, "Prefixo:", color=C_TEXT_MED).pack(side="left", padx=(0,6))
-        self.var_cons_prefixo = tk.StringVar(value="bps_dw_da__Classe_")
+        self.var_cons_prefixo = tk.StringVar(value="DA-DW Classe ")
         _entry(ro, textvariable=self.var_cons_prefixo, width=180).pack(side="left")
         _lbl(ro, "Sufixo:", color=C_TEXT_MED).pack(side="left", padx=(14,6))
         self.var_cons_sufixo = tk.StringVar()
@@ -1596,18 +1605,33 @@ class App(ctk.CTk):
                width=70).pack(side="left")
 
         rc = ctk.CTkFrame(inn2, fg_color="transparent"); rc.pack(fill="x", pady=3)
+        _lbl(rc, "Processos:", color=C_TEXT_MED).pack(side="left", padx=(0,6))
+        # Um processo por classe divide a gravação, que é onde está ~92% do
+        # tempo. Padrão 1 (sequencial): o paralelo é opt-in até você validar.
+        try:
+            nucleos = os.cpu_count() or 1
+        except Exception:
+            nucleos = 1
+        opcoes = [str(n) for n in (1, 2, 3, 4, 6, 8) if n <= max(1, nucleos)] or ["1"]
+        self.var_cons_processos = tk.StringVar(value="1")
+        ctk.CTkOptionMenu(rc, values=opcoes, variable=self.var_cons_processos,
+                          font=("Segoe UI",12), width=62, height=28,
+                          corner_radius=6, fg_color=C_SURFACE,
+                          button_color=C_BORDER, button_hover_color=C_ACCENT,
+                          text_color=C_TEXT,
+                          dropdown_font=("Segoe UI",12)).pack(side="left", padx=(0,18))
         self.var_cons_dup = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(rc, text="Gerar CSV de auditoria com as duplicatas removidas",
+        ctk.CTkCheckBox(rc, text="Gerar CSV de auditoria das duplicatas",
                         variable=self.var_cons_dup, font=("Segoe UI",12),
                         text_color=C_TEXT, fg_color=C_ACCENT,
-                        border_color=C_BORDER).pack(side="left", padx=(0,20))
+                        border_color=C_BORDER).pack(side="left", padx=(0,18))
         self.var_cons_dedup_interno = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(rc, text="Também remover repetições internas do DA",
+        ctk.CTkCheckBox(rc, text="Remover repetições internas do DA",
                         variable=self.var_cons_dedup_interno, font=("Segoe UI",12),
                         text_color=C_TEXT, fg_color=C_ACCENT,
                         border_color=C_BORDER).pack(side="left")
-        _lbl(rc, "  (atenção: costumam ser registros distintos, com fornecedor "
-                 "e preço diferentes)", size=10, color=C_TEXT_LIGHT).pack(side="left")
+        _lbl(rc, "  (costumam ser registros distintos)", size=10,
+             color=C_TEXT_LIGHT).pack(side="left")
 
         # ── Resumo ───────────────────────────────────────────────────────────
         grid = ctk.CTkFrame(parent, fg_color=C_BG)
@@ -2973,11 +2997,12 @@ class App(ctk.CTk):
             dw=[e["caminho"] for e in self._cons_entradas if e["origem"] == "dw"],
             da=[e["caminho"] for e in self._cons_entradas if e["origem"] == "da"],
             saida=saida,
-            prefixo=self.var_cons_prefixo.get().strip() or "bps_dw_da__Classe_",
+            prefixo=self.var_cons_prefixo.get() or "DA-DW Classe ",
             sufixo=self.var_cons_sufixo.get().strip(),
             ano_min=ano_min, ano_max=ano_max,
             salvar_duplicatas=bool(self.var_cons_dup.get()),
             dedup_interno_da=bool(self.var_cons_dedup_interno.get()),
+            processos=int(self.var_cons_processos.get() or 1),
         )
 
         self._cons_rodando  = True
@@ -3001,6 +3026,9 @@ class App(ctk.CTk):
         if ano_min or ano_max:
             self._log_cons(f"📅 Filtro de ano: "
                            f"{ano_min or '—'} a {ano_max or '—'}", "info")
+        if params["processos"] > 1:
+            self._log_cons(f"⚙ Gravação em {params['processos']} processos "
+                           f"paralelos (uma classe por processo).", "info")
         if params["dedup_interno_da"]:
             self._log_cons("⚠ Dedup interno do DA ativo: repetições da mesma "
                            "chave dentro do próprio DA também serão removidas.",
@@ -3084,7 +3112,7 @@ class App(ctk.CTk):
 
         pct = (t.get("da_dup", 0) / t["da_lidas"] * 100) if t.get("da_lidas") else 0
         self._log_cons("\n" + "═" * 58, "info")
-        self._log_cons(f"✅ {len(gerados)} planilha(s) gerada(s) em: "
+        self._log_cons(f"✅ {res.get('arquivos', len(gerados))} planilha(s) gerada(s) em: "
                        f"{res.get('pasta_saida','')}", "ok")
         self._log_cons(f"   Relatório: {res.get('relatorio','')}", "ok")
         self._log_cons(f"   DA removido (já estava no DW): "
@@ -3100,6 +3128,17 @@ class App(ctk.CTk):
                            f"corrompida(s) fora das planilhas — conteúdo "
                            f"preservado em {res.get('arquivo_quarentena','')}.",
                            "warn")
+        if res.get("catmat_prefixos"):
+            self._log_cons("• CATMAT do DW com dígitos a mais à esquerda "
+                           "(mantidos os 6 da direita): "
+                           + " | ".join(f"{k} → {self._fmt_br(v)} linhas"
+                                        for k, v in res["catmat_prefixos"].items()),
+                           "info")
+        if res.get("celulas_higienizadas"):
+            self._log_cons(f"⚠ {self._fmt_br(res['celulas_higienizadas'])} célula(s) "
+                           f"tinham caracteres de controle e foram higienizadas "
+                           f"(o texto foi mantido, os caracteres viraram espaço).",
+                           "warn")
         if res.get("modalidades_desconhecidas"):
             self._log_cons("⚠ Códigos de modalidade não mapeados: "
                            + ", ".join(res["modalidades_desconhecidas"])
@@ -3109,7 +3148,7 @@ class App(ctk.CTk):
 
         messagebox.showinfo("Concluído",
             f"Consolidação finalizada!\n\n"
-            f"Planilhas geradas: {len(gerados)}\n"
+            f"Planilhas geradas: {res.get('arquivos', len(gerados))}\n"
             f"Linhas do DW: {self._fmt_br(t.get('dw', 0))}\n"
             f"Duplicatas removidas do DA: {self._fmt_br(t.get('da_dup', 0))}\n"
             f"Linhas do DA mantidas: {self._fmt_br(t.get('da_mantidas', 0))}\n\n"
@@ -3151,7 +3190,8 @@ CAMPO_DATA_DA = "dataCompra"
 
 # Formatar a data em dd/mm/aaaa custa ~35% de tempo a mais na gravação.
 # Com False, a data sai como aaaa-mm-dd (mais rápido, ainda é data de verdade).
-FORMATAR_DATA_BR = True
+# (FORMATAR_DATA_BR saiu: no xlsxwriter o formato de data vem do
+#  default_date_format da pasta de trabalho, não de cada célula.)
 
 # Modalidades do DA (códigos do SIASG). Complete se aparecerem códigos novos —
 # o script avisa no fim quais códigos não estavam mapeados.
@@ -3261,7 +3301,6 @@ COLS_DA = [
     ("Preço Total", "moeda", 14),
 ]
 
-_FORMATO_POR_TIPO = {"data": FORMATO_DATA, "qtde": FORMATO_QTDE, "moeda": FORMATO_MOEDA}
 
 
 # =============================================================================
@@ -3455,10 +3494,33 @@ def _leitor(linha, idx):
     return g
 
 
+TAM_CATMAT = 6
+
+# Quantas vezes cada prefixo excedente foi removido do CATMAT do DW. Serve para
+# o log: se aparecer algo diferente de "1000", é sinal de que a origem mudou e
+# vale conferir antes de confiar no resultado.
+_CATMAT_PREFIXOS = {}
+
+
 def _catmat(valor: str):
     if CATMAT_COMO_TEXTO or not valor:
         return valor
     return inteiro(valor) if so_digitos(valor) == valor else valor
+
+
+def _catmat_dw(valor: str):
+    """No DW o CATMAT às vezes vem com dígitos a mais à esquerda (ex.: 1000610972
+    para o CATMAT 610972). Fica só com os 6 da direita.
+
+    Só mexe quando o valor é todo numérico e tem mais de 6 dígitos: qualquer
+    coisa com letra, símbolo ou 6 dígitos ou menos passa intacta, para não
+    inventar truncamento onde não há. O DA não passa por aqui — vem limpo da API.
+    """
+    if valor and len(valor) > TAM_CATMAT and so_digitos(valor) == valor:
+        prefixo = valor[:-TAM_CATMAT]
+        _CATMAT_PREFIXOS[prefixo] = _CATMAT_PREFIXOS.get(prefixo, 0) + 1
+        valor = valor[-TAM_CATMAT:]
+    return _catmat(valor)
 
 
 def transformar_dw(linha, idx):
@@ -3478,7 +3540,7 @@ def transformar_dw(linha, idx):
     total = round(qtde * preco, 2) if (qtde is not None and preco is not None) else None
     saida = [
         chave,
-        _catmat(g("catmat")),
+        _catmat_dw(g("catmat")),
         g("descricao material servico"),
         g("unidade fornecimento"),
         inteiro(classe),
@@ -3599,87 +3661,204 @@ def _letra(i: int) -> str:
     return letra
 
 
-class SaidaClasse:
-    """Um arquivo .xlsx por classe, com as abas dw-XXXX e da-XXXX."""
+# =============================================================================
+# SAÍDA: uma pasta de trabalho por classe, com exatamente as abas DW e DA
+# =============================================================================
 
-    def __init__(self, classe: str):
-        self.classe = classe
-        self.wb = Workbook(write_only=True)
-        self.abas = {"dw": [], "da": []}
-        self._nova_aba("dw")                      # garante a aba do DW mesmo vazia
+_CAB_XLSX = {"bold": True, "bg_color": "1F4E79", "font_color": "FFFFFF",
+             "align": "center", "valign": "vcenter", "text_wrap": True}
+_NUM_XLSX = {"data": FORMATO_DATA, "qtde": FORMATO_QTDE, "moeda": FORMATO_MOEDA}
 
-    def _nova_aba(self, tipo: str):
-        cols = COLS_DW if tipo == "dw" else COLS_DA
-        n = len(self.abas[tipo]) + 1
-        nome = f"{tipo}-{self.classe}" + (f" ({n})" if n > 1 else "")
-        ws = self.wb.create_sheet(nome[:31])
-        for i, (_titulo, tipo_col, largura) in enumerate(cols):
-            dim = ws.column_dimensions[_letra(i)]
-            dim.width = largura
-            if tipo_col in _FORMATO_POR_TIPO and tipo_col != "data":
-                dim.number_format = _FORMATO_POR_TIPO[tipo_col]
-        cabecalho = []
-        for titulo, _t, _l in cols:
-            c = WriteOnlyCell(ws, value=titulo)
-            c.font, c.fill, c.alignment = _FONTE_CAB, _FUNDO_CAB, _ALINHA_CAB
-            cabecalho.append(c)
-        # Em modo write_only, tudo o que vem antes de <sheetData> (painéis,
-        # larguras, formatos de coluna) precisa ser definido ANTES do primeiro
-        # append; o atributo simples ws.freeze_panes não é serializado.
-        Worksheet.freeze_panes.fset(ws, "A2")
-        ws.append(cabecalho)
-        registro = [ws, 1]
-        self.abas[tipo].append(registro)
-        return registro
 
-    def append(self, tipo: str, valores: list):
-        registro = self.abas[tipo][-1] if self.abas[tipo] else self._nova_aba(tipo)
-        if registro[1] >= LIMITE_LINHAS_PLANILHA:
-            registro = self._nova_aba(tipo)
-        ws = registro[0]
-        if FORMATAR_DATA_BR:
-            cols = COLS_DW if tipo == "dw" else COLS_DA
-            valores = list(valores)
-            for i, (_t, tipo_col, _l) in enumerate(cols):
-                if tipo_col == "data" and valores[i] is not None:
-                    c = WriteOnlyCell(ws, value=valores[i])
-                    c.number_format = FORMATO_DATA
-                    valores[i] = c
-        ws.append(valores)
+class SaidaParte:
+    """Uma pasta de trabalho .xlsx com exatamente duas abas: DW e DA.
+
+    Quando uma classe não cabe em um único arquivo (limite de 1.048.576 linhas
+    por aba do Excel), o excedente vai para "... - Parte 2", "... - Parte 3" —
+    nunca para uma terceira aba. O corte é feito em fronteira de ano, de modo
+    que um ano nunca fica dividido entre dois arquivos (a menos que o ano
+    sozinho estoure o limite, caso raro que é avisado no log).
+    """
+
+    celulas_higienizadas = 0            # zerado a cada consolidar()
+
+    def __init__(self, caminho: Path, linhas_previstas: dict):
+        self.caminho = caminho
+        self.wb = xlsxwriter.Workbook(str(caminho), {
+            "constant_memory": True,           # escreve linha a linha, sem inchar a RAM
+            "default_date_format": FORMATO_DATA,
+            "strings_to_numbers": False,       # "000183" continua texto
+            "strings_to_urls": False,          # descrição longa não vira hyperlink
+        })
+        fmt_cab = self.wb.add_format(_CAB_XLSX)
+        self.abas = {}
+        for fonte, cols in (("dw", COLS_DW), ("da", COLS_DA)):
+            ws = self.wb.add_worksheet(fonte.upper())
+            for i, (_titulo, tipo_col, largura) in enumerate(cols):
+                # No xlsxwriter o formato de coluna já vale para as células
+                # escritas sem formato próprio — não é preciso criar um objeto
+                # de célula por data, como o openpyxl exigia.
+                if tipo_col in _NUM_XLSX:
+                    ws.set_column(i, i, largura,
+                                  self.wb.add_format({"num_format": _NUM_XLSX[tipo_col]}))
+                else:
+                    ws.set_column(i, i, largura)
+            ws.freeze_panes(1, 0)
+            ws.write_row(0, 0, [t for t, _x, _l in cols], fmt_cab)
+            n = max(linhas_previstas.get(fonte, 0), 1)
+            ws.autofilter(0, 0, n, len(cols) - 1)
+            self.abas[fonte] = [ws, 0]
+
+    def append(self, fonte: str, valores: list) -> bool:
+        """Grava uma linha. Devolve False se a aba encheu (não coube)."""
+        registro = self.abas[fonte]
+        if registro[1] >= LIMITE_LINHAS_PLANILHA - 1:      # -1 por causa do cabeçalho
+            return False
+        # Caracteres de controle (\x00-\x1f) vêm no texto livre da origem. O
+        # openpyxl levantava IllegalCharacterError e matava a aba; o xlsxwriter
+        # é pior, escreve "MICRODONT_x0001_ STERIL" em silêncio. Por isso a
+        # limpeza é preventiva. O search() antes do sub() custa ~1,6s por milhão
+        # de linhas, contra ~110s que a escrita dessas linhas leva.
+        for i, v in enumerate(valores):
+            if type(v) is str and _CTRL_ILEGAIS.search(v):
+                valores[i] = _CTRL_ILEGAIS.sub(" ", v)
+                SaidaParte.celulas_higienizadas += 1
         registro[1] += 1
+        registro[0].write_row(registro[1], 0, valores)
+        return True
+
+    def fechar(self):
+        self.wb.close()
 
     def descartar(self):
-        """Abandona a planilha sem gravar (cancelamento).
+        """Cancelamento: fecha os temporários e apaga o arquivo pela metade."""
+        try:
+            self.wb.close()
+        except Exception:
+            pass
+        try:
+            if self.caminho.exists():
+                self.caminho.unlink()
+        except Exception:
+            pass
 
-        Em modo write_only cada aba escreve num arquivo temporário através de
-        um gerador lxml. Se o objeto simplesmente for coletado pelo garbage
-        collector, o gerador é fechado no meio de um elemento XML e o Python
-        imprime um "Exception ignored ... LxmlSyntaxError". Fechar na ordem
-        certa (aba -> tempfile) evita o ruído e ainda apaga os temporários.
-        """
-        for registros in self.abas.values():
-            for registro in registros:
-                ws = registro[0]
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-                escritor = getattr(ws, "_writer", None)
-                if escritor is not None:
-                    try:
-                        escritor.cleanup()
-                    except Exception:
-                        pass
-        self.abas = {"dw": [], "da": []}
 
-    def salvar(self, caminho: Path):
-        for tipo, cols in (("dw", COLS_DW), ("da", COLS_DA)):
-            if not self.abas[tipo]:
-                self._nova_aba(tipo)
-            ultima = _letra(len(cols) - 1)
-            for ws, linhas in self.abas[tipo]:
-                ws.auto_filter.ref = f"A1:{ultima}{max(linhas, 1)}"
-        self.wb.save(caminho)
+# =============================================================================
+# PLANEJAMENTO DAS PARTES
+# =============================================================================
+
+def _rotulo_ano(ano):
+    return str(ano) if ano else "sem ano"
+
+
+def planejar_partes(contagens: dict, prefixo: str, sufixo: str,
+                    log=print) -> tuple:
+    """Decide quantos arquivos cada classe terá e qual ano vai em qual.
+
+    contagens: {(classe, ano): {"dw": n, "da": n}}  -- ano é int ou None
+    Devolve (plano, roteador):
+        plano[classe]                 = [{"parte":1,"nome":...,"anos":[...],
+                                          "dw":n,"da":n}, ...]
+        roteador[(classe, ano, fonte)] = [(quantidade, indice_parte), ...]
+    O roteador é uma lista porque um único ano grande demais precisa ser
+    dividido entre partes; no caso normal ela tem um elemento só.
+    """
+    limite = LIMITE_LINHAS_PLANILHA - 1
+    classes = sorted({c for c, _a in contagens})
+    plano, roteador = {}, {}
+
+    for classe in classes:
+        anos = sorted({a for c, a in contagens if c == classe},
+                      key=lambda a: (a is None, a or 0))   # "sem ano" por último
+        partes = [{"parte": 1, "anos": [], "dw": 0, "da": 0}]
+        for ano in anos:
+            q = contagens[(classe, ano)]
+            atual = partes[-1]
+            # Cabe inteiro na parte corrente?
+            if (atual["dw"] + q["dw"] <= limite and atual["da"] + q["da"] <= limite):
+                if q["dw"] or q["da"]:
+                    atual["anos"].append(ano)
+                    atual["dw"] += q["dw"]; atual["da"] += q["da"]
+                    for fonte in ("dw", "da"):
+                        if q[fonte]:
+                            roteador[(classe, ano, fonte)] = [(q[fonte], len(partes) - 1)]
+                continue
+            # Não cabe: abre parte nova, salvo se o ano sozinho estoura o limite
+            if q["dw"] <= limite and q["da"] <= limite:
+                if not atual["anos"]:                     # parte vazia, evita buraco
+                    partes.pop()
+                partes.append({"parte": len(partes) + 1, "anos": [ano],
+                               "dw": q["dw"], "da": q["da"]})
+                for fonte in ("dw", "da"):
+                    if q[fonte]:
+                        roteador[(classe, ano, fonte)] = [(q[fonte], len(partes) - 1)]
+                continue
+            # Caso raro: um único ano maior que o limite -> divide o ano
+            log(f"  ! Classe {classe}, ano {_rotulo_ano(ano)}: "
+                f"dw={q['dw']:,} da={q['da']:,} — o ano sozinho passa do limite "
+                f"do Excel e precisou ser dividido entre arquivos."
+                .replace(",", "."))
+            idx_inicial = len(partes) - 1
+            for fonte in ("dw", "da"):
+                restante, trechos = q[fonte], []
+                idx = idx_inicial      # cada fonte enche a partir da mesma parte,
+                                       # senão o DA começaria depois do DW e
+                                       # deixaria abas DA vazias nas primeiras
+                while restante > 0:
+                    livre = limite - partes[idx][fonte]
+                    if livre <= 0:
+                        partes.append({"parte": len(partes) + 1, "anos": [],
+                                       "dw": 0, "da": 0})
+                        idx = len(partes) - 1
+                        continue
+                    usa = min(livre, restante)
+                    partes[idx][fonte] += usa
+                    if ano not in partes[idx]["anos"]:
+                        partes[idx]["anos"].append(ano)
+                    trechos.append((usa, idx))
+                    restante -= usa
+                    idx += 1
+                    if restante and idx >= len(partes):
+                        partes.append({"parte": len(partes) + 1, "anos": [],
+                                       "dw": 0, "da": 0})
+                if trechos:
+                    roteador[(classe, ano, fonte)] = trechos
+
+        partes = [p for p in partes if p["dw"] or p["da"]]
+        for i, p in enumerate(partes, start=1):
+            p["parte"] = i
+            p["nome"] = (f"{prefixo}{classe}{sufixo}"
+                         + (f" - Parte {i}" if i > 1 else "") + ".xlsx")
+        plano[classe] = partes
+
+    return plano, roteador
+
+
+class Roteador:
+    """Diz em qual parte cada linha deve cair, na ordem em que ela aparece.
+
+    A contagem da 1ª passada e a gravação da 2ª leem os mesmos arquivos na
+    mesma ordem, então o n-ésimo registro de (classe, ano, fonte) é sempre o
+    mesmo nas duas — é isso que torna o plano determinístico.
+    """
+
+    def __init__(self, roteador: dict, partes_abertas: dict):
+        self._plano = roteador
+        self._abertas = partes_abertas          # {(classe, indice): SaidaParte}
+        self._vistas = {}
+
+    def destino(self, classe, ano, fonte):
+        chave = (classe, ano, fonte)
+        trechos = self._plano.get(chave)
+        if not trechos:
+            return None
+        n = self._vistas.get(chave, 0)
+        self._vistas[chave] = n + 1
+        for quantidade, idx in trechos:
+            if n < quantidade:
+                return self._abertas.get((classe, idx))
+            n -= quantidade
+        return self._abertas.get((classe, trechos[-1][1]))
 
 
 # =============================================================================
@@ -3744,12 +3923,27 @@ class Quarentena:
             self._arq.close()
 
 
-def processar_dw(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
-                 quarentena, verbose=True, log=print, cancelado=None,
-                 progresso=None):
+def processar_dw(arquivos, estatisticas, chaves_dw, ano_min, ano_max,
+                 quarentena, modo="contar", contagens=None, roteador=None,
+                 verbose=True, log=print, cancelado=None, progresso=None,
+                 ao_gravar=None):
+    """Percorre os arquivos do DW.
+
+    modo="contar": monta o índice de chaves, as estatísticas, a quarentena e a
+        contagem por (classe, ano) que alimenta o plano de partes.
+    modo="gravar": repete exatamente a mesma triagem, mas só escreve nas
+        planilhas já abertas.
+
+    As duas passadas leem os mesmos arquivos na mesma ordem, então a n-ésima
+    linha de cada (classe, ano) é a mesma nas duas. É isso que faz o plano
+    fechar: sem contar antes, não há como saber em que ano cortar o arquivo,
+    porque as linhas não chegam em ordem de ano.
+    """
+    contando = (modo == "contar")
+    total = len(arquivos)
     for i_arq, arq in enumerate(arquivos, start=1):
         if progresso:
-            progresso(i_arq - 1, len(arquivos), f"DW · {arq.name}")
+            progresso(i_arq - 1, total, f"DW · {arq.name}")
         if cancelado and cancelado():
             raise Cancelado()
         gen = ler_tabela(arq)
@@ -3757,7 +3951,7 @@ def processar_dw(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
             idx = indices(next(gen))
         except StopIteration:
             continue
-        if "classe" not in idx:
+        if contando and "classe" not in idx:
             log(f"  ! {arq.name}: coluna 'Classe' não encontrada - as linhas irão "
                 f"para SEM_CLASSE")
         gravadas = ignoradas = invalidas = 0
@@ -3769,37 +3963,58 @@ def processar_dw(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
                 continue
             chave, classe, saida, erro = transformar_dw(linha, idx)
             if erro:
-                invalidas += 1
-                _est(estatisticas, classe if classe.isdigit() else "SEM_CLASSE")["dw_invalidas"] += 1
-                quarentena.registrar("DW", arq.name, n_linha, erro, linha)
+                if contando:
+                    invalidas += 1
+                    _est(estatisticas,
+                         classe if classe.isdigit() else "SEM_CLASSE")["dw_invalidas"] += 1
+                    quarentena.registrar("DW", arq.name, n_linha, erro, linha)
                 continue
             classe = classe or "SEM_CLASSE"
-            chaves_dw.add(int(chave))              # int ocupa menos memória que str
-            ano = saida[16]
+            if contando:
+                chaves_dw.add(int(chave))      # int ocupa menos memória que str
+            ano = saida[16]                    # Ano Resultado Compra
             if (ano_min and ano and ano < ano_min) or (ano_max and ano and ano > ano_max):
                 ignoradas += 1
                 continue
-            if classe not in saidas:
-                saidas[classe] = SaidaClasse(classe)
-            saidas[classe].append("dw", saida)
-            _est(estatisticas, classe)["dw"] += 1
+            if contando:
+                contagens.setdefault((classe, ano), {"dw": 0, "da": 0})["dw"] += 1
+                _est(estatisticas, classe)["dw"] += 1
+            else:
+                destino = roteador.destino(classe, ano, "dw")
+                if destino is not None:
+                    destino.append("dw", saida)
+                    if ao_gravar:
+                        ao_gravar()
             gravadas += 1
-        if verbose:
+        if verbose and contando:
             extra = f" | {ignoradas} fora do filtro de ano" if ignoradas else ""
             extra += f" | {invalidas} em quarentena" if invalidas else ""
             log(f"  [DW] {arq.name}: {gravadas:,} linhas{extra}".replace(",", "."))
     if progresso:
-        progresso(len(arquivos), len(arquivos), "DW concluído")
+        progresso(total, total, "DW concluído" if contando else "DW gravado")
 
 
-def processar_da(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
+
+def processar_da(arquivos, estatisticas, chaves_dw, ano_min, ano_max,
                  dedup_interno, escritor_dup, modalidades_desconhecidas,
-                 quarentena, verbose=True, log=print, cancelado=None,
-                 progresso=None):
+                 quarentena, modo="contar", contagens=None, roteador=None,
+                 verbose=True, log=print, cancelado=None, progresso=None,
+                 ao_gravar=None, pular=None, pular_registro=None):
+    """Percorre os arquivos do DA. Mesmos dois modos do processar_dw.
+
+    Na contagem, `pular_registro` recebe o número das linhas descartadas como
+    duplicata. Na gravação, `pular` traz essa mesma lista de volta e as linhas
+    são puladas sem consultar o índice de chaves — que aí nem precisa existir.
+    É o que permite gravar em outro processo sem replicar centenas de MB.
+    """
+    contando = (modo == "contar")
     vistas_da = set() if dedup_interno else None
+    total = len(arquivos)
     for i_arq, arq in enumerate(arquivos, start=1):
+        pular_aqui = (pular or {}).get(str(arq)) if pular is not None else None
+        cursor = 0
         if progresso:
-            progresso(i_arq - 1, len(arquivos), f"DA · {arq.name}")
+            progresso(i_arq - 1, total, f"DA · {arq.name}")
         if cancelado and cancelado():
             raise Cancelado()
         gen = ler_tabela(arq)
@@ -3816,47 +4031,65 @@ def processar_da(arquivos, saidas, estatisticas, chaves_dw, ano_min, ano_max,
                 continue
             primeira = txt(linha[0]).lower()
             if primeira.startswith(("totalregistros", "totalpaginas", "idcompra")):
-                continue                            # rodapé da API ou cabeçalho repetido
+                continue                        # rodapé da API ou cabeçalho repetido
             lidas += 1
-            chave, classe, saida, erro = transformar_da(linha, idx, modalidades_desconhecidas)
+            chave, classe, saida, erro = transformar_da(linha, idx,
+                                                        modalidades_desconhecidas)
             if erro:
-                invalidas += 1
-                _est(estatisticas, classe if classe.isdigit() else "SEM_CLASSE")["da_invalidas"] += 1
-                quarentena.registrar("DA", arq.name, n_linha, erro, linha)
+                if contando:
+                    invalidas += 1
+                    _est(estatisticas,
+                         classe if classe.isdigit() else "SEM_CLASSE")["da_invalidas"] += 1
+                    quarentena.registrar("DA", arq.name, n_linha, erro, linha)
                 continue
             classe = classe or "SEM_CLASSE"
-            e = _est(estatisticas, classe)
-            e["da_lidas"] += 1
+            if contando:
+                _est(estatisticas, classe)["da_lidas"] += 1
 
-            if int(chave) in chaves_dw:
-                dup += 1
-                e["da_dup"] += 1
-                if escritor_dup:
-                    escritor_dup.writerow([classe, chave, arq.name, saida[1],
-                                           saida[15] or "", saida[12], saida[18]])
-                continue
-            if vistas_da is not None:
-                if int(chave) in vistas_da:
-                    e["da_dup_interna"] += 1
+            if contando:
+                if int(chave) in chaves_dw:
+                    dup += 1
+                    _est(estatisticas, classe)["da_dup"] += 1
+                    if escritor_dup:
+                        escritor_dup.writerow([classe, chave, arq.name, saida[1],
+                                               saida[15] or "", saida[12], saida[18]])
+                    if pular_registro is not None:
+                        pular_registro.setdefault(str(arq), array("l")).append(n_linha)
                     continue
-                vistas_da.add(int(chave))
+                if vistas_da is not None:
+                    if int(chave) in vistas_da:
+                        _est(estatisticas, classe)["da_dup_interna"] += 1
+                        if pular_registro is not None:
+                            pular_registro.setdefault(str(arq), array("l")).append(n_linha)
+                        continue
+                    vistas_da.add(int(chave))
+            elif pular_aqui is not None:
+                if cursor < len(pular_aqui) and pular_aqui[cursor] == n_linha:
+                    cursor += 1
+                    dup += 1
+                    continue
 
-            ano = saida[14]
+            ano = saida[14]                     # Ano, derivado de dataCompra
             if (ano_min and ano and ano < ano_min) or (ano_max and ano and ano > ano_max):
                 ignoradas += 1
                 continue
-            if classe not in saidas:
-                saidas[classe] = SaidaClasse(classe)
-            saidas[classe].append("da", saida)
-            e["da_mantidas"] += 1
+            if contando:
+                contagens.setdefault((classe, ano), {"dw": 0, "da": 0})["da"] += 1
+                _est(estatisticas, classe)["da_mantidas"] += 1
+            else:
+                destino = roteador.destino(classe, ano, "da")
+                if destino is not None:
+                    destino.append("da", saida)
+                    if ao_gravar:
+                        ao_gravar()
             mantidas += 1
-        if verbose:
+        if verbose and contando:
             extra = f" | {ignoradas} fora do filtro de ano" if ignoradas else ""
             extra += f" | {invalidas} em quarentena" if invalidas else ""
             log(f"  [DA] {arq.name}: {lidas:,} lidas | {dup:,} duplicadas removidas | "
                 f"{mantidas:,} mantidas{extra}".replace(",", "."))
     if progresso:
-        progresso(len(arquivos), len(arquivos), "DA concluído")
+        progresso(total, total, "DA concluído" if contando else "DA gravado")
 
 
 def gravar_relatorio(caminho: Path, estatisticas: dict, arquivos_gerados: dict):
@@ -3884,21 +4117,174 @@ def gravar_relatorio(caminho: Path, estatisticas: dict, arquivos_gerados: dict):
 
 
 # =============================================================================
+# GRAVAÇÃO EM PARALELO (um processo por grupo de classes)
+# =============================================================================
+#
+# Só a 2ª passada é paralelizada, e é onde está o tempo: ler e transformar são
+# ~8% do trabalho, gravar o .xlsx é ~92%. Cada processo abre e fecha as próprias
+# pastas de trabalho, então não há estado compartilhado — o que cruza a fronteira
+# entre processos é só o plano (pequeno) e as linhas do DA a pular.
+#
+# Os trabalhadores NÃO recebem o índice de chaves do DW: seriam centenas de MB
+# replicados. Em vez disso a 1ª passada anota o número das linhas do DA que
+# foram descartadas como duplicata, e o trabalhador simplesmente as pula. Isso
+# ainda libera o índice antes da parte pesada do serviço.
+
+
+def _dividir_classes(plano: dict, n_grupos: int) -> list:
+    """Distribui as classes entre os processos equilibrando o total de linhas.
+
+    Guloso, da maior para a menor: a classe mais pesada vai sempre para o grupo
+    mais folgado. Sem isso, uma classe grande sozinha num grupo faria todos os
+    outros processos terminarem cedo e ficarem esperando.
+    """
+    pesos = {c: sum(p["dw"] + p["da"] for p in partes)
+             for c, partes in plano.items()}
+    grupos = [{"classes": [], "peso": 0} for _ in range(max(1, n_grupos))]
+    for classe in sorted(pesos, key=lambda c: -pesos[c]):
+        g = min(grupos, key=lambda g: g["peso"])
+        g["classes"].append(classe)
+        g["peso"] += pesos[classe]
+    return [g["classes"] for g in grupos if g["classes"]]
+
+
+def _tarefa_gravar(tarefa: dict, fila, evento_cancelar):
+    """Executado em processo separado: grava as partes das classes recebidas."""
+    saidas = {}
+    try:
+        SaidaParte.celulas_higienizadas = 0
+        dir_saida = Path(tarefa["saida"])
+        for classe, partes in tarefa["plano"].items():
+            for i, p in enumerate(partes):
+                saidas[(classe, i)] = SaidaParte(dir_saida / p["nome"],
+                                                 {"dw": p["dw"], "da": p["da"]})
+        roteador = Roteador(tarefa["rotas"], saidas)
+        arquivos_dw = [Path(a) for a in tarefa["arquivos_dw"]]
+        arquivos_da = [Path(a) for a in tarefa["arquivos_da"]]
+
+        escritas = [0]
+        def _contar(n=1):
+            escritas[0] += n
+            if escritas[0] % 20000 == 0:
+                fila.put(("prog", 20000))
+
+        cancelado = evento_cancelar.is_set
+        processar_dw(arquivos_dw, {}, None, tarefa["ano_min"], tarefa["ano_max"],
+                     None, modo="gravar", roteador=roteador, verbose=False,
+                     cancelado=cancelado, ao_gravar=_contar)
+        processar_da(arquivos_da, {}, None, tarefa["ano_min"], tarefa["ano_max"],
+                     False, None, set(), None, modo="gravar", roteador=roteador,
+                     pular=tarefa["pular_da"], verbose=False,
+                     cancelado=cancelado, ao_gravar=_contar)
+
+        for (classe, _i), parte in sorted(saidas.items()):
+            parte.fechar()
+            fila.put(("log", f"  ✓ {parte.caminho.name}"))
+        fila.put(("prog", escritas[0] % 20000))
+        fila.put(("ok", {"celulas": SaidaParte.celulas_higienizadas,
+                         "classes": list(tarefa["plano"])}))
+    except Cancelado:
+        for parte in saidas.values():
+            parte.descartar()
+        fila.put(("cancelado", None))
+    except Exception as e:
+        for parte in saidas.values():
+            parte.descartar()
+        fila.put(("erro", f"{type(e).__name__}: {e}"))
+
+
+def gravar_em_paralelo(plano, rotas, arquivos_dw, arquivos_da, dir_saida,
+                       ano_min, ano_max, pular_da, n_processos, total_linhas,
+                       log=print, progresso=None, cancelado=None) -> dict:
+    """Dispara os processos e vai repassando log e progresso para a interface."""
+    # spawn em todo lugar: é o único modo do Windows, e usá-lo também no Linux
+    # evita que um bug só apareça na máquina do usuário.
+    ctx = multiprocessing.get_context("spawn")
+    fila, evento = ctx.Queue(), ctx.Event()
+    grupos = _dividir_classes(plano, n_processos)
+
+    processos = []
+    for classes in grupos:
+        tarefa = {
+            "saida": str(dir_saida),
+            "arquivos_dw": [str(a) for a in arquivos_dw],
+            "arquivos_da": [str(a) for a in arquivos_da],
+            "plano": {c: plano[c] for c in classes},
+            "rotas": {k: v for k, v in rotas.items() if k[0] in set(classes)},
+            "pular_da": pular_da,
+            "ano_min": ano_min, "ano_max": ano_max,
+        }
+        p = ctx.Process(target=_tarefa_gravar, args=(tarefa, fila, evento),
+                        daemon=True)
+        p.start()
+        processos.append(p)
+        log(f"  processo {p.pid}: classe(s) {', '.join(classes)}")
+
+    resumo = {"celulas": 0, "erro": None, "cancelado": False}
+    escritas, pendentes = 0, len(processos)
+    while pendentes:
+        if cancelado and cancelado() and not evento.is_set():
+            evento.set()
+        try:
+            tipo, dado = fila.get(timeout=0.2)
+        except queue.Empty:
+            # Um processo pode morrer sem conseguir avisar (falta de memória,
+            # por exemplo). Sem esta checagem o laço esperaria para sempre.
+            vivos = sum(1 for p in processos if p.is_alive())
+            if vivos == 0 and fila.empty():
+                if pendentes:
+                    resumo["erro"] = resumo["erro"] or (
+                        "um processo de gravação terminou sem responder")
+                break
+            continue
+        if tipo == "prog":
+            escritas += dado
+            if progresso and total_linhas:
+                progresso(min(escritas / total_linhas, 1.0),
+                          f"Gravando ({escritas:,} linhas)".replace(",", "."))
+        elif tipo == "log":
+            log(dado)
+        elif tipo == "ok":
+            resumo["celulas"] += dado["celulas"]
+            pendentes -= 1
+        elif tipo == "cancelado":
+            resumo["cancelado"] = True
+            pendentes -= 1
+        elif tipo == "erro":
+            resumo["erro"] = dado
+            evento.set()
+            pendentes -= 1
+
+    for p in processos:
+        p.join(timeout=60)
+        if p.is_alive():
+            p.terminate()
+    return resumo
+
+
+# =============================================================================
 # MOTOR REUTILIZÁVEL
 # =============================================================================
 
 def consolidar(entradas=(), dw=(), da=(), saida=".",
-               prefixo="bps_dw_da__Classe_", sufixo="",
+               prefixo="DA-DW Classe ", sufixo="",
                ano_min=None, ano_max=None,
-               salvar_duplicatas=False, dedup_interno_da=False,
+               salvar_duplicatas=False, dedup_interno_da=False, processos=1,
                log=print, progresso=None, cancelado=None) -> dict:
     """Consolida DW + DA e devolve um resumo do que foi feito.
 
-    É o mesmo motor usado pela linha de comando; os três callbacks existem para
-    a interface gráfica:
-        log(msg)                       -> uma linha de texto para o usuário
-        progresso(fracao, rotulo)      -> fracao entre 0.0 e 1.0
-        cancelado() -> bool            -> True interrompe (levanta Cancelado)
+    São duas passadas pelos arquivos de entrada. A primeira só conta (e monta
+    o índice de chaves, a quarentena e a auditoria de duplicatas); a segunda
+    grava. A contagem é necessária porque cada classe vira UMA pasta de
+    trabalho com exatamente as abas DW e DA, e o excedente vai para "Parte 2",
+    "Parte 3" — cortando em fronteira de ano. Como as linhas não chegam em
+    ordem de ano, não há como decidir o corte sem contar antes. A releitura
+    custa pouco: ler e transformar é ~8% do tempo, gravar o xlsx é ~92%.
+
+    Os três callbacks existem para a interface gráfica:
+        log(msg)                   -> uma linha de texto para o usuário
+        progresso(fracao, rotulo)  -> fracao entre 0.0 e 1.0
+        cancelado() -> bool        -> True interrompe (levanta Cancelado)
     """
     dir_saida = Path(saida)
     dir_saida.mkdir(parents=True, exist_ok=True)
@@ -3913,6 +4299,8 @@ def consolidar(entradas=(), dw=(), da=(), saida=".",
         "estatisticas": {}, "gerados": {}, "pasta_saida": str(dir_saida),
         "totais": {"dw": 0, "da_lidas": 0, "da_dup": 0, "da_mantidas": 0},
         "quarentena": 0, "arquivo_quarentena": None, "arquivo_duplicatas": None,
+        "celulas_higienizadas": 0, "arquivos": 0, "partes": {},
+        "catmat_prefixos": {},
         "modalidades_desconhecidas": [], "relatorio": None,
     }
 
@@ -3920,16 +4308,20 @@ def consolidar(entradas=(), dw=(), da=(), saida=".",
         log("Nenhum arquivo .csv/.xlsx encontrado nas entradas informadas.")
         return resultado
 
-    # ── Fatias da barra de progresso: ler DW, ler DA, gravar planilhas ────────
     def _fracao(base, peso):
         def _cb(feito, total, rotulo=""):
             if progresso:
                 progresso(base + peso * (feito / total if total else 1), rotulo)
         return _cb
 
-    saidas, estatisticas, chaves_dw = {}, {}, set()
+    saidas = {}                       # {(classe, indice_parte): SaidaParte}
+    estatisticas, chaves_dw, contagens = {}, set(), {}
+    pular_da = {}                     # {arquivo: linhas do DA a descartar}
     modalidades_desconhecidas = set()
     quarentena = Quarentena(dir_saida / "linhas_em_quarentena.csv")
+    SaidaParte.celulas_higienizadas = 0
+    _CATMAT_PREFIXOS.clear()
+    prefixos_catmat = {}
     arq_dup = escritor_dup = None
 
     try:
@@ -3958,11 +4350,19 @@ def consolidar(entradas=(), dw=(), da=(), saida=".",
         resultado["arquivos_da"] = len(arquivos_da)
         resultado["ignorados"] = [a.name for a in ignorados]
 
-        log("\n[1/3] Lendo o DW e montando o índice de chaves...")
-        processar_dw(arquivos_dw, saidas, estatisticas, chaves_dw, ano_min,
-                     ano_max, quarentena, log=log, cancelado=cancelado,
-                     progresso=_fracao(0.0, 0.45))
+        # ── 1ª passada: contar ───────────────────────────────────────────────
+        log("\n[1/4] Lendo o DW e montando o índice de chaves...")
+        processar_dw(arquivos_dw, estatisticas, chaves_dw, ano_min, ano_max,
+                     quarentena, modo="contar", contagens=contagens, log=log,
+                     cancelado=cancelado, progresso=_fracao(0.00, 0.05))
         log(f"  -> {len(chaves_dw):,} chaves únicas no DW".replace(",", "."))
+        prefixos_catmat = dict(_CATMAT_PREFIXOS)
+        if prefixos_catmat:
+            detalhe = " | ".join(f"{pre} ({n:,} linhas)".replace(",", ".")
+                                 for pre, n in sorted(prefixos_catmat.items(),
+                                                      key=lambda kv: -kv[1]))
+            log(f"  CATMAT do DW com dígitos a mais à esquerda, mantidos os "
+                f"{TAM_CATMAT} da direita: {detalhe}")
 
         if salvar_duplicatas:
             arq_dup = open(dir_saida / "duplicatas_removidas.csv", "w",
@@ -3972,42 +4372,131 @@ def consolidar(entradas=(), dw=(), da=(), saida=".",
                                    "Catmat", "dataCompra", "nomeFornecedor",
                                    "precoUnitario"])
 
-        log("\n[2/3] Lendo o DA e removendo as duplicatas...")
-        processar_da(arquivos_da, saidas, estatisticas, chaves_dw, ano_min,
-                     ano_max, dedup_interno_da, escritor_dup,
-                     modalidades_desconhecidas, quarentena, log=log,
-                     cancelado=cancelado, progresso=_fracao(0.45, 0.40))
+        log("\n[2/4] Lendo o DA e removendo as duplicatas...")
+        processar_da(arquivos_da, estatisticas, chaves_dw, ano_min, ano_max,
+                     dedup_interno_da, escritor_dup, modalidades_desconhecidas,
+                     quarentena, modo="contar", contagens=contagens, log=log,
+                     pular_registro=pular_da,
+                     cancelado=cancelado, progresso=_fracao(0.05, 0.05))
+        if arq_dup:
+            arq_dup.close(); arq_dup = None
+        quarentena.fechar()
+
+        if not contagens:
+            log("\n⚠ Nenhuma linha válida sobrou para gravar.")
+            resultado["estatisticas"] = estatisticas
+            resultado["quarentena"] = quarentena.total
+            resultado["arquivo_quarentena"] = (quarentena.caminho.name
+                                               if quarentena.total else None)
+            return resultado
+
+        # ── Plano das partes ─────────────────────────────────────────────────
+        log("\n[3/4] Planejando os arquivos...")
+        plano, rotas = planejar_partes(contagens, prefixo, sufixo, log=log)
+        n_arquivos = sum(len(p) for p in plano.values())
+        for classe, partes in plano.items():
+            if len(partes) > 1:
+                log(f"  Classe {classe}: {len(partes)} arquivos "
+                    + " | ".join(f"Parte {p['parte']}: "
+                                 f"{_rotulo_ano(p['anos'][0])}–{_rotulo_ano(p['anos'][-1])}"
+                                 for p in partes))
+        log(f"  {n_arquivos} arquivo(s) a gravar, "
+            f"{len(plano)} classe(s).")
+
+        # O índice de chaves já cumpriu seu papel: as duplicatas viraram lista
+        # de linhas a pular. Liberá-lo aqui devolve centenas de MB justamente
+        # antes da fase pesada — e é o que permite gravar em outros processos.
+        chaves_dw.clear()
+
+        total_linhas = sum(p["dw"] + p["da"]
+                           for partes in plano.values() for p in partes)
+        n_proc = min(max(1, int(processos or 1)), len(plano))
+
+        log("\n[4/4] Gravando as planilhas...")
+        usar_sequencial = n_proc <= 1
+        if n_proc > 1:
+            log(f"  {n_proc} processos em paralelo "
+                f"({len(plano)} classe(s) a distribuir)")
+            try:
+                resumo = gravar_em_paralelo(
+                    plano, rotas, arquivos_dw, arquivos_da, dir_saida,
+                    ano_min, ano_max, pular_da, n_proc, total_linhas,
+                    log=log, progresso=(lambda f, r="": progresso(0.10 + 0.75 * f, r))
+                    if progresso else None, cancelado=cancelado)
+            except Exception as e:                 # não conseguiu nem iniciar
+                resumo = {"celulas": 0, "cancelado": False,
+                          "erro": f"{type(e).__name__}: {e}"}
+            if resumo["cancelado"]:
+                raise Cancelado()
+            if resumo["erro"]:
+                # A 1ª passada pode ter levado dezenas de minutos; jogá-la fora
+                # por causa do multiprocessing seria cruel. Refaz sequencial.
+                log(f"  ⚠ A gravação em paralelo falhou ({resumo['erro']}).")
+                log("    Refazendo em um processo só — vai demorar mais, mas o "
+                    "resultado é o mesmo.")
+                for partes in plano.values():
+                    for pt in partes:
+                        alvo = dir_saida / pt["nome"]
+                        if alvo.exists():
+                            try:
+                                alvo.unlink()
+                            except OSError:
+                                pass
+                usar_sequencial = True
+            else:
+                SaidaParte.celulas_higienizadas += resumo["celulas"]
+        if usar_sequencial:
+            for classe, partes in plano.items():
+                for i, pt in enumerate(partes):
+                    saidas[(classe, i)] = SaidaParte(dir_saida / pt["nome"],
+                                                     {"dw": pt["dw"], "da": pt["da"]})
+            roteador = Roteador(rotas, saidas)
+            processar_dw(arquivos_dw, estatisticas, None, ano_min, ano_max,
+                         None, modo="gravar", roteador=roteador, log=log,
+                         verbose=False, cancelado=cancelado,
+                         progresso=_fracao(0.10, 0.45))
+            processar_da(arquivos_da, estatisticas, None, ano_min, ano_max,
+                         False, None, modalidades_desconhecidas,
+                         None, modo="gravar", roteador=roteador, log=log,
+                         verbose=False, pular=pular_da, cancelado=cancelado,
+                         progresso=_fracao(0.55, 0.30))
     except Cancelado:
         resultado["cancelado"] = True
-        for saida_classe in saidas.values():
-            saida_classe.descartar()
+        for parte in saidas.values():
+            parte.descartar()
         saidas.clear()
-        log("\n🛑 Consolidação cancelada — nenhuma planilha foi gravada.")
-        return resultado
-    finally:
         if arq_dup:
             arq_dup.close()
         quarentena.fechar()
+        log("\n🛑 Consolidação cancelada — nenhuma planilha foi gravada.")
+        return resultado
 
-    log("\n[3/3] Gravando as planilhas...")
-    gerados = {}
-    classes = sorted(saidas)
-    for i, classe in enumerate(classes, start=1):
-        nome = f"{prefixo}{classe}{sufixo}.xlsx"
-        saidas[classe].salvar(dir_saida / nome)
-        gerados[classe] = nome
-        e = _est(estatisticas, classe)
-        log(f"  {nome}: dw={e['dw']:,} | da={e['da_mantidas']:,} "
-            f"(removidas {e['da_dup']:,})".replace(",", "."))
+    # ── Fechamento (é aqui que o .xlsx é de fato montado no disco) ───────────
+    # No caminho paralelo cada processo já fechou as suas; aqui `saidas` está
+    # vazio e só o plano descreve o que foi gravado.
+    total_partes = len(saidas)
+    for i, (_chave, parte) in enumerate(sorted(saidas.items()), start=1):
+        parte.fechar()
         if progresso:
-            progresso(0.85 + 0.15 * (i / len(classes)), f"Gravando {nome}")
+            progresso(0.85 + 0.14 * (i / total_partes),
+                      f"Fechando {parte.caminho.name}")
+    gerados = {classe: [p["nome"] for p in partes]
+               for classe, partes in plano.items()}
+    for classe, partes in plano.items():
+        for p in partes:
+            log(f"  {p['nome']}: dw={p['dw']:,} | da={p['da']:,} "
+                f"| anos {_rotulo_ano(p['anos'][0])}–{_rotulo_ano(p['anos'][-1])}"
+                .replace(",", "."))
 
     nome_relatorio = "Relatorio_Consolidacao.xlsx"
-    gravar_relatorio(dir_saida / nome_relatorio, estatisticas, gerados)
+    gravar_relatorio(dir_saida / nome_relatorio, estatisticas,
+                     {c: " | ".join(n) for c, n in gerados.items()})
 
     resultado.update({
         "estatisticas": estatisticas,
-        "gerados": gerados,
+        "gerados": {c: " | ".join(n) for c, n in gerados.items()},
+        "partes": {c: [p["nome"] for p in ps] for c, ps in plano.items()},
+        "arquivos": sum(len(v) for v in gerados.values()),
         "relatorio": nome_relatorio,
         "totais": {
             "dw":          sum(e["dw"] for e in estatisticas.values()),
@@ -4018,6 +4507,8 @@ def consolidar(entradas=(), dw=(), da=(), saida=".",
         "quarentena": quarentena.total,
         "arquivo_quarentena": quarentena.caminho.name if quarentena.total else None,
         "arquivo_duplicatas": "duplicatas_removidas.csv" if salvar_duplicatas else None,
+        "celulas_higienizadas": SaidaParte.celulas_higienizadas,
+        "catmat_prefixos": prefixos_catmat,
         "modalidades_desconhecidas": sorted(modalidades_desconhecidas),
     })
     if progresso:
@@ -4050,9 +4541,12 @@ def _cli_consolidacao():
                     help="também remove repetições da mesma chave dentro do próprio DA "
                          "(atenção: costumam ser registros distintos, de fornecedores "
                          "e preços diferentes)")
+    ap.add_argument("--processos", type=int, default=1,
+                    help="processos paralelos na gravação (1 = sequencial)")
     args = ap.parse_args()
 
     r = consolidar(entradas=args.entrada, dw=args.dw, da=args.da,
+                   processos=args.processos,
                    saida=args.saida, prefixo=args.prefixo, sufixo=args.sufixo,
                    ano_min=args.ano_min, ano_max=args.ano_max,
                    salvar_duplicatas=args.salvar_duplicatas,
@@ -4072,6 +4566,13 @@ def _cli_consolidacao():
         print(f"\n! {r['quarentena']:,} linha(s) corrompida(s) não entraram nas planilhas."
               .replace(",", "."))
         print(f"  Conteúdo preservado em: {r['arquivo_quarentena']}")
+    if r["catmat_prefixos"]:
+        print("\n! CATMAT do DW com dígitos a mais à esquerda: "
+              + " | ".join(f"{k} ({v:,})".replace(",", ".")
+                           for k, v in r["catmat_prefixos"].items()))
+    if r["celulas_higienizadas"]:
+        print(f"\n! {r['celulas_higienizadas']:,} célula(s) com caracteres de controle "
+              f"foram higienizadas.".replace(",", "."))
     if r["modalidades_desconhecidas"]:
         print(f"\n! Códigos de modalidade não mapeados: "
               f"{', '.join(r['modalidades_desconhecidas'])}"
@@ -4082,6 +4583,10 @@ def _cli_consolidacao():
 
 # =============================================================================
 if __name__ == "__main__":
+    # PRECISA ser a primeira coisa: no Windows os processos filhos reexecutam o
+    # programa, e sem isto um .exe congelado abriria uma janela nova a cada
+    # processo, sem parar.
+    multiprocessing.freeze_support()
     # Com argumentos, roda a consolidação em linha de comando; sem eles,
     # abre a interface. Ex.: python ExtratorCatmat.py -e ENTRADA -s SAIDA
     if len(sys.argv) > 1:
